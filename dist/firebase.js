@@ -9,7 +9,11 @@ import {
   deleteDoc,
   query,
   where,
-  orderBy
+  orderBy,
+  limit,
+  arrayUnion,
+  runTransaction,
+  onSnapshot
 } from "firebase/firestore";
 import { ref, uploadBytes, getDownloadURL, deleteObject } from "firebase/storage";
 function prune(o) {
@@ -26,9 +30,15 @@ function createFirebaseAdapter(config) {
   const storage = config.storage;
   const auth = config.auth;
   const collPath = config.collectionPath ?? "annotations";
-  const [settingsColl, settingsId] = (config.settingsPath ?? "annotate_settings/global").split("/");
+  const settingsFullPath = config.settingsPath ?? "annotate_settings/global";
+  if (settingsFullPath.split("/").filter(Boolean).length % 2 !== 0) {
+    throw new Error(`annotate: settingsPath must be a document path like 'collection/doc' (got '${settingsFullPath}')`);
+  }
   const storageDir = config.storagePath ?? "annotations";
+  const listLimit = config.listLimit ?? 1e3;
   const col = collection(db, collPath);
+  const settingsRef = doc(db, settingsFullPath);
+  const urlCache = /* @__PURE__ */ new Map();
   async function claims() {
     if (!auth?.currentUser) return {};
     try {
@@ -52,8 +62,12 @@ function createFirebaseAdapter(config) {
   }
   async function urlFor(path) {
     if (!path) return null;
+    const hit = urlCache.get(path);
+    if (hit) return hit;
     try {
-      return await getDownloadURL(ref(storage, path));
+      const u = await getDownloadURL(ref(storage, path));
+      urlCache.set(path, u);
+      return u;
     } catch {
       return null;
     }
@@ -62,16 +76,16 @@ function createFirebaseAdapter(config) {
     async getAccess() {
       const me = await resolveUser();
       const isAdmin = await resolveIsAdmin(me);
-      let enabled = true;
+      let enabled = false;
       try {
-        const snap = await getDoc(doc(db, settingsColl, settingsId));
+        const snap = await getDoc(settingsRef);
         if (snap.exists() && typeof snap.data().enabled === "boolean") enabled = snap.data().enabled;
       } catch {
       }
       return { enabled, isAdmin, canUse: enabled || isAdmin, seeAll: isAdmin, me };
     },
     async setAccess(enabled) {
-      await setDoc(doc(db, settingsColl, settingsId), { enabled }, { merge: true });
+      await setDoc(settingsRef, { enabled }, { merge: true });
       return { message: enabled ? "Enabled for all users" : "ADMIN-only" };
     },
     async list() {
@@ -86,12 +100,12 @@ function createFirebaseAdapter(config) {
         }
       };
       if (isAdmin) {
-        const s = await getDocs(query(col, orderBy("id", "desc")));
+        const s = await getDocs(query(col, orderBy("id", "desc"), limit(listLimit)));
         collect(s.docs);
       } else {
         const [pub, mine] = await Promise.all([
-          getDocs(query(col, where("visibility", "==", "public"))),
-          me.email ? getDocs(query(col, where("created_by", "==", me.email))) : Promise.resolve({ docs: [] })
+          getDocs(query(col, where("visibility", "==", "public"), orderBy("id", "desc"), limit(listLimit))),
+          me.email ? getDocs(query(col, where("created_by", "==", me.email), orderBy("id", "desc"), limit(listLimit))) : Promise.resolve({ docs: [] })
         ]);
         collect(pub.docs);
         collect(mine.docs);
@@ -104,17 +118,28 @@ function createFirebaseAdapter(config) {
     },
     async save(input) {
       const me = await resolveUser();
-      const id = Date.now();
-      const row = prune({
+      const base = {
         ...input,
-        id,
         status: "open",
         created_by: me.email ?? "",
         created_by_name: me.name ?? me.email ?? "",
         created_by_role: me.role ?? null,
         created_at: (/* @__PURE__ */ new Date()).toISOString()
+      };
+      let id = 0;
+      await runTransaction(db, async (tx) => {
+        for (let i = 0; i < 6; i++) {
+          const cand = Date.now() * 1e3 + Math.floor(Math.random() * 1e3);
+          const dref = doc(col, String(cand));
+          const snap = await tx.get(dref);
+          if (!snap.exists()) {
+            id = cand;
+            tx.set(dref, prune({ ...base, id }));
+            return;
+          }
+        }
+        throw new Error("annotate: could not allocate a unique id \u2014 retry");
       });
-      await setDoc(doc(col, String(id)), row);
       return { id };
     },
     async update(patch) {
@@ -126,18 +151,18 @@ function createFirebaseAdapter(config) {
       const path = snap.exists() ? snap.data().screenshot_path : void 0;
       await deleteDoc(doc(col, String(id)));
       if (path) {
+        urlCache.delete(path);
         try {
           await deleteObject(ref(storage, path));
-        } catch {
+        } catch (e) {
+          console.warn("[annotate] screenshot delete failed", e);
         }
       }
     },
     async addReply(id, note) {
       const me = await resolveUser();
-      const snap = await getDoc(doc(col, String(id)));
-      const replies = snap.exists() && Array.isArray(snap.data().replies) ? snap.data().replies : [];
-      replies.push({ note, author: me.name ?? me.email ?? "", at: (/* @__PURE__ */ new Date()).toISOString() });
-      await updateDoc(doc(col, String(id)), { replies });
+      const reply = { note: note.slice(0, 2e3), author: me.name ?? me.email ?? "", at: (/* @__PURE__ */ new Date()).toISOString() };
+      await updateDoc(doc(col, String(id)), { replies: arrayUnion(reply), updated_at: (/* @__PURE__ */ new Date()).toISOString() });
     },
     async clearResolved() {
       const s = await getDocs(query(col, where("status", "in", ["done", "dismissed"])));
@@ -145,21 +170,28 @@ function createFirebaseAdapter(config) {
         const path = d.data().screenshot_path;
         await deleteDoc(d.ref);
         if (path) {
+          urlCache.delete(path);
           try {
             await deleteObject(ref(storage, path));
-          } catch {
+          } catch (e) {
+            console.warn("[annotate] screenshot delete failed", e);
           }
         }
       }));
       return { message: `Cleared ${s.docs.length} resolved` };
     },
-    async uploadScreenshot(file) {
-      const me = await resolveUser();
-      const safe = (me.email ?? "anon").replace(/[^a-z0-9._-]/gi, "_");
+    async uploadScreenshot(file, opts) {
+      const vis = opts?.visibility === "public" ? "public" : "private";
+      const uid = auth?.currentUser?.uid;
+      if (!uid) throw new Error("annotate: must be signed in to upload a screenshot");
       const rand = Math.random().toString(36).slice(2, 8);
-      const path = `${storageDir}/${safe}/${Date.now()}-${rand}.png`;
+      const path = `${storageDir}/${vis}/${uid}/${Date.now()}-${rand}.png`;
       await uploadBytes(ref(storage, path), file, { contentType: file.type || "image/png" });
       return { path };
+    },
+    subscribe(onChange) {
+      return onSnapshot(query(col, where("visibility", "==", "public")), () => onChange(), () => {
+      });
     }
   };
 }

@@ -3,20 +3,35 @@ rules_version = '2';
 // annotate-kit — Cloud Storage rules for annotation screenshots. Merge into your storage.rules and deploy:
 //   firebase deploy --only storage
 //
-// Screenshots live under /annotations/**. Any signed-in user may read (so getDownloadURL works) and
-// upload. Delete is left open to signed-in users because Storage rules can't read Firestore ownership;
-// tighten to a per-user prefix if you need stricter control.
+// Screenshots are stored under  annotations/<visibility>/<uid>/<file>  (the adapter builds this path):
+//   * public/<uid>/…   readable by any signed-in user (these back 'public' marks)
+//   * private/<uid>/…  readable ONLY by the owner (uid) or an admin
+// Uploads may only go into the caller's OWN uid folder, are limited to <5MB images, and existing
+// objects cannot be overwritten. Delete is restricted to the owner or an admin.
 //
-// NOTE: if you set storagePath on the adapter, rename the match path below to match.
+// NOTE: if you set storagePath on the adapter, rename the 'annotations' segment below to match.
 
 service firebase.storage {
   match /b/{bucket}/o {
 
     function annotSignedIn() { return request.auth != null; }
+    function annotIsAdmin() {
+      return annotSignedIn() && (request.auth.token.admin == true || request.auth.token.role == 'admin');
+    }
+    function annotImageOk() {
+      return request.resource.size < 5 * 1024 * 1024
+        && request.resource.contentType.matches('image/.*');
+    }
 
-    match /annotations/{allPaths=**} {
-      allow read: if annotSignedIn();
-      allow write: if annotSignedIn();   // create + update + delete
+    match /annotations/{visibility}/{uid}/{allPaths=**} {
+      allow read: if annotSignedIn()
+        && (visibility == 'public' || request.auth.uid == uid || annotIsAdmin());
+      allow create: if annotSignedIn()
+        && request.auth.uid == uid
+        && (visibility == 'public' || visibility == 'private')
+        && annotImageOk();
+      allow delete: if annotSignedIn() && (request.auth.uid == uid || annotIsAdmin());
+      allow update: if false;   // no overwriting an existing object
     }
   }
 }

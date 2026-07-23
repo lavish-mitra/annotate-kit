@@ -3,13 +3,14 @@
 // Security rules are the real gate; this is just the client.
 import type { Firestore } from 'firebase/firestore'
 import {
-  collection, doc, getDoc, getDocs, setDoc, updateDoc, deleteDoc, query, where, orderBy,
+  collection, doc, getDoc, getDocs, setDoc, updateDoc, deleteDoc, query, where, orderBy, limit,
+  arrayUnion, runTransaction, onSnapshot,
 } from 'firebase/firestore'
 import type { FirebaseStorage } from 'firebase/storage'
 import { ref, uploadBytes, getDownloadURL, deleteObject } from 'firebase/storage'
 import type { Auth } from 'firebase/auth'
 import type { StorageAdapter } from '../adapter'
-import type { Annotation, NewAnnotation, AnnotationPatch, AnnotateAccess } from '../types'
+import type { Annotation, NewAnnotation, AnnotationPatch, AnnotateAccess, AnnVisibility } from '../types'
 
 export type ResolvedUser = { email?: string; name?: string; role?: string }
 
@@ -20,10 +21,12 @@ export type FirebaseAdapterConfig = {
   auth?: Auth
   /** Firestore collection for marks (default 'annotations'). */
   collectionPath?: string
-  /** Firestore doc holding the global toggle (default: 'annotate_settings/global'). */
+  /** Firestore doc holding the global toggle, as 'collection/doc' (default: 'annotate_settings/global'). */
   settingsPath?: string
   /** Storage folder for screenshots (default 'annotations'). */
   storagePath?: string
+  /** Max docs fetched per list() call (default 1000). Keeps polling bounded on busy projects. */
+  listLimit?: number
   /** Is the current viewer an admin? boolean or predicate.
    *  Default: the auth user's custom claim `admin === true` or `role === 'admin'`
    *  (must match backend/firebase/firestore.rules isAdmin()). */
@@ -48,9 +51,15 @@ export function createFirebaseAdapter(config: FirebaseAdapterConfig): StorageAda
   const storage = config.storage
   const auth = config.auth
   const collPath = config.collectionPath ?? 'annotations'
-  const [settingsColl, settingsId] = (config.settingsPath ?? 'annotate_settings/global').split('/')
+  const settingsFullPath = config.settingsPath ?? 'annotate_settings/global'
+  if (settingsFullPath.split('/').filter(Boolean).length % 2 !== 0) {
+    throw new Error(`annotate: settingsPath must be a document path like 'collection/doc' (got '${settingsFullPath}')`)
+  }
   const storageDir = config.storagePath ?? 'annotations'
+  const listLimit = config.listLimit ?? 1000
   const col = collection(db, collPath)
+  const settingsRef = doc(db, settingsFullPath)
+  const urlCache = new Map<string, string>()   // download URLs are long-lived; cache per session
 
   async function claims(): Promise<Record<string, unknown>> {
     if (!auth?.currentUser) return {}
@@ -71,23 +80,25 @@ export function createFirebaseAdapter(config: FirebaseAdapterConfig): StorageAda
   }
   async function urlFor(path?: string | null): Promise<string | null> {
     if (!path) return null
-    try { return await getDownloadURL(ref(storage, path)) } catch { return null }
+    const hit = urlCache.get(path)
+    if (hit) return hit
+    try { const u = await getDownloadURL(ref(storage, path)); urlCache.set(path, u); return u } catch { return null }
   }
 
   return {
     async getAccess(): Promise<AnnotateAccess> {
       const me = await resolveUser()
       const isAdmin = await resolveIsAdmin(me)
-      let enabled = true
+      let enabled = false
       try {
-        const snap = await getDoc(doc(db, settingsColl, settingsId))
+        const snap = await getDoc(settingsRef)
         if (snap.exists() && typeof snap.data().enabled === 'boolean') enabled = snap.data().enabled
-      } catch { /* missing → default enabled */ }
+      } catch { /* missing → treat as disabled (admin-only) */ }
       return { enabled, isAdmin, canUse: enabled || isAdmin, seeAll: isAdmin, me }
     },
 
     async setAccess(enabled: boolean) {
-      await setDoc(doc(db, settingsColl, settingsId), { enabled }, { merge: true })
+      await setDoc(settingsRef, { enabled }, { merge: true })
       return { message: enabled ? 'Enabled for all users' : 'ADMIN-only' }
     },
 
@@ -103,12 +114,12 @@ export function createFirebaseAdapter(config: FirebaseAdapterConfig): StorageAda
         }
       }
       if (isAdmin) {
-        const s = await getDocs(query(col, orderBy('id', 'desc')))
+        const s = await getDocs(query(col, orderBy('id', 'desc'), limit(listLimit)))
         collect(s.docs)
       } else {
         const [pub, mine] = await Promise.all([
-          getDocs(query(col, where('visibility', '==', 'public'))),
-          me.email ? getDocs(query(col, where('created_by', '==', me.email))) : Promise.resolve({ docs: [] as never[] }),
+          getDocs(query(col, where('visibility', '==', 'public'), orderBy('id', 'desc'), limit(listLimit))),
+          me.email ? getDocs(query(col, where('created_by', '==', me.email), orderBy('id', 'desc'), limit(listLimit))) : Promise.resolve({ docs: [] as never[] }),
         ])
         collect(pub.docs); collect(mine.docs)
       }
@@ -119,13 +130,22 @@ export function createFirebaseAdapter(config: FirebaseAdapterConfig): StorageAda
 
     async save(input: NewAnnotation) {
       const me = await resolveUser()
-      const id = Date.now()
-      const row = prune({
-        ...input, id, status: 'open',
+      const base = {
+        ...input, status: 'open',
         created_by: me.email ?? '', created_by_name: me.name ?? me.email ?? '', created_by_role: me.role ?? null,
         created_at: new Date().toISOString(),
+      }
+      // Allocate a collision-free numeric id transactionally (never overwrite an existing mark).
+      let id = 0
+      await runTransaction(db, async (tx) => {
+        for (let i = 0; i < 6; i++) {
+          const cand = Date.now() * 1000 + Math.floor(Math.random() * 1000)
+          const dref = doc(col, String(cand))
+          const snap = await tx.get(dref)
+          if (!snap.exists()) { id = cand; tx.set(dref, prune({ ...base, id }) as Record<string, unknown>); return }
+        }
+        throw new Error('annotate: could not allocate a unique id — retry')
       })
-      await setDoc(doc(col, String(id)), row as Record<string, unknown>)
       return { id }
     },
 
@@ -138,15 +158,14 @@ export function createFirebaseAdapter(config: FirebaseAdapterConfig): StorageAda
       const snap = await getDoc(doc(col, String(id)))
       const path = snap.exists() ? (snap.data().screenshot_path as string | undefined) : undefined
       await deleteDoc(doc(col, String(id)))
-      if (path) { try { await deleteObject(ref(storage, path)) } catch { /* already gone */ } }
+      if (path) { urlCache.delete(path); try { await deleteObject(ref(storage, path)) } catch (e) { console.warn('[annotate] screenshot delete failed', e) } }
     },
 
     async addReply(id: number, note: string) {
       const me = await resolveUser()
-      const snap = await getDoc(doc(col, String(id)))
-      const replies = snap.exists() && Array.isArray(snap.data().replies) ? (snap.data().replies as unknown[]) : []
-      replies.push({ note, author: me.name ?? me.email ?? '', at: new Date().toISOString() })
-      await updateDoc(doc(col, String(id)), { replies })
+      const reply = { note: note.slice(0, 2000), author: me.name ?? me.email ?? '', at: new Date().toISOString() }
+      // atomic append — no read-modify-write race
+      await updateDoc(doc(col, String(id)), { replies: arrayUnion(reply), updated_at: new Date().toISOString() })
     },
 
     async clearResolved() {
@@ -154,18 +173,25 @@ export function createFirebaseAdapter(config: FirebaseAdapterConfig): StorageAda
       await Promise.all(s.docs.map(async (d) => {
         const path = d.data().screenshot_path as string | undefined
         await deleteDoc(d.ref)
-        if (path) { try { await deleteObject(ref(storage, path)) } catch { /* already gone */ } }
+        if (path) { urlCache.delete(path); try { await deleteObject(ref(storage, path)) } catch (e) { console.warn('[annotate] screenshot delete failed', e) } }
       }))
       return { message: `Cleared ${s.docs.length} resolved` }
     },
 
-    async uploadScreenshot(file: File) {
-      const me = await resolveUser()
-      const safe = (me.email ?? 'anon').replace(/[^a-z0-9._-]/gi, '_')
+    async uploadScreenshot(file: File, opts?: { visibility?: AnnVisibility }) {
+      const vis = opts?.visibility === 'public' ? 'public' : 'private'
+      const uid = auth?.currentUser?.uid
+      if (!uid) throw new Error('annotate: must be signed in to upload a screenshot')
       const rand = Math.random().toString(36).slice(2, 8)
-      const path = `${storageDir}/${safe}/${Date.now()}-${rand}.png`
+      const path = `${storageDir}/${vis}/${uid}/${Date.now()}-${rand}.png`
       await uploadBytes(ref(storage, path), file, { contentType: file.type || 'image/png' })
       return { path }
+    },
+
+    subscribe(onChange: () => void) {
+      // Live for public marks (any signed-in user may read them); the overlay's slow safety poll
+      // covers own/admin-only changes.
+      return onSnapshot(query(col, where('visibility', '==', 'public')), () => onChange(), () => { /* ignore */ })
     },
   }
 }

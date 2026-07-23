@@ -1,0 +1,51 @@
+name: 🐛 Bug report
+description: Something isn't working as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug! For **security** problems, please use
+        [SECURITY.md](../blob/main/SECURITY.md) instead of a public issue.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Mount `<Annotate adapter={…} />`
+        2. …
+        3. See error
+    validations:
+      required: true
+  - type: dropdown
+    id: adapter
+    attributes:
+      label: Which adapter?
+      options: [local, idb, rest, supabase, firebase, custom / other]
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: annotate-kit version
+      placeholder: e.g. 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      placeholder: React 19, Next.js 15, Chrome 140, macOS…
+  - type: textarea
+    id: logs
+    attributes:
+      label: Console / network output
+      description: Paste any relevant errors (redact anything sensitive).
+      render: shell

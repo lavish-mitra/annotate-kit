@@ -9,7 +9,18 @@ rules_version = '2';
 // (set via the Admin SDK: admin.auth().setCustomUserClaims(uid, { admin: true })).
 // The client adapter's isAdmin default matches this.
 //
-// NOTE: if you set collectionPath / settingsPath on the adapter, rename the match paths below to match.
+// Security notes (kept at parity with the Supabase backend):
+//   * Ships admin-only: non-admin read/create is gated on the global toggle at
+//     annotate_settings/global (enabled == true). New marks default to visibility:'private'.
+//   * created_by is pinned to your own email on create and IMMUTABLE on update — no author forgery.
+//   * Anyone who can SEE a mark (public, or owner, or admin) may append a reply.
+//   * Payload sizes are capped to blunt storage/cost abuse.
+//   * NOTE (created_by_name/role): these are client-written display values on Firebase and are not
+//     server-verified (unlike Supabase's trigger). Treat only created_by (email) as trustworthy.
+//   * NOTE (screenshots): getDownloadURL tokens are bearer links; a private screenshot's URL is only
+//     stored in owner/admin-readable docs, but the link itself bypasses Storage rules once known.
+//
+// NOTE: if you set collectionPath / settingsPath on the adapter, rename the match/settings paths below.
 
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -19,16 +30,49 @@ service cloud.firestore {
       return annotSignedIn() && (request.auth.token.admin == true || request.auth.token.role == 'admin');
     }
     function annotMyEmail() { return request.auth.token.email; }
+    // Global on/off toggle — mirrors Supabase's annotate_enabled(). Reads the settings doc.
+    function annotEnabled() {
+      return exists(/databases/$(database)/documents/annotate_settings/global)
+        && get(/databases/$(database)/documents/annotate_settings/global).data.enabled == true;
+    }
+    function annotSizeOk() {
+      let d = request.resource.data;
+      return (!('note' in d) || d.note.size() <= 5000)
+        && (!('target_text' in d) || d.target_text.size() <= 2000)
+        && (!('target_selector' in d) || d.target_selector.size() <= 1000)
+        && (!('points' in d) || d.points == null || d.points.size() <= 4000)
+        && (!('console_logs' in d) || d.console_logs == null || d.console_logs.size() <= 50)
+        && (!('network_logs' in d) || d.network_logs == null || d.network_logs.size() <= 100)
+        && (!('replies' in d) || d.replies == null || d.replies.size() <= 200)
+        && (!('dom_snapshot' in d) || d.dom_snapshot == null || d.dom_snapshot.size() <= 20000);
+    }
 
     match /annotations/{id} {
-      // Admins see everything; everyone else sees their own + public marks.
+      // Admins see everything; everyone else sees their own + public marks — but only while enabled.
       allow read: if annotIsAdmin()
-        || (annotSignedIn() && resource.data.created_by == annotMyEmail())
-        || (annotSignedIn() && resource.data.visibility == 'public');
-      // Create only as yourself.
-      allow create: if annotSignedIn() && request.resource.data.created_by == annotMyEmail();
-      // Edit / delete your own, or admin.
-      allow update, delete: if annotIsAdmin()
+        || (annotEnabled() && annotSignedIn()
+            && (resource.data.created_by == annotMyEmail() || resource.data.visibility == 'public'));
+      // Create only as yourself, only while enabled (or admin), with valid visibility + bounded size.
+      allow create: if (annotIsAdmin() || annotEnabled())
+        && annotSignedIn()
+        && request.resource.data.created_by == annotMyEmail()
+        && request.resource.data.visibility in ['public', 'private']
+        && annotSizeOk();
+      // Edit your own (or admin) with created_by immutable, OR append a reply to any PUBLIC mark you can see.
+      allow update: if (
+          (annotIsAdmin() || (annotSignedIn() && resource.data.created_by == annotMyEmail()))
+          && request.resource.data.created_by == resource.data.created_by
+          && request.resource.data.visibility in ['public', 'private']
+          && annotSizeOk()
+        ) || (
+          annotSignedIn()
+          && resource.data.visibility == 'public'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['replies', 'updated_at'])
+          && request.resource.data.created_by == resource.data.created_by
+          && annotSizeOk()
+        );
+      // Delete your own, or admin.
+      allow delete: if annotIsAdmin()
         || (annotSignedIn() && resource.data.created_by == annotMyEmail());
     }
 

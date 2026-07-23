@@ -12,6 +12,7 @@ export type AnnReply = { note: string; author?: string; at?: string }
 export type AnnPoint = { x: number; y: number }
 export type AnnMeta = { browser?: string; os?: string; device?: string; viewport?: string; screen?: string; dpr?: number; url?: string; ua?: string }
 export type AnnLog = { level: string; text: string; at?: string }
+export type AnnNetLog = { method: string; url: string; status?: number; ms?: number; ok?: boolean; at?: string }
 
 export type Annotation = {
   id: number
@@ -48,6 +49,8 @@ export type Annotation = {
   // auto technical context + captured console/JS errors (reproducible bug reports)
   meta?: AnnMeta | null
   console_logs?: AnnLog[] | null
+  network_logs?: AnnNetLog[] | null
+  dom_snapshot?: string | null
 }
 
 // What the overlay hands the adapter to persist a new mark (server assigns id/timestamps/author).

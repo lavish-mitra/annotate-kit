@@ -28,6 +28,14 @@ type AnnLog = {
     text: string;
     at?: string;
 };
+type AnnNetLog = {
+    method: string;
+    url: string;
+    status?: number;
+    ms?: number;
+    ok?: boolean;
+    at?: string;
+};
 type Annotation = {
     id: number;
     page_route: string;
@@ -61,6 +69,8 @@ type Annotation = {
     el_context?: string[] | null;
     meta?: AnnMeta | null;
     console_logs?: AnnLog[] | null;
+    network_logs?: AnnNetLog[] | null;
+    dom_snapshot?: string | null;
 };
 type NewAnnotation = Omit<Annotation, 'id' | 'status' | 'created_at' | 'updated_at' | 'screenshot_url' | 'created_by' | 'created_by_role' | 'created_by_name'> & {
     screenshot_path?: string | null;
@@ -80,33 +90,4 @@ type AnnotateAccess = {
     };
 };
 
-interface StorageAdapter {
-    /** Who is looking + what they may do. Called on mount (and after toggling access). */
-    getAccess(): Promise<AnnotateAccess>;
-    /** Flip the global "visible to all users" toggle (ADMIN only). */
-    setAccess(enabled: boolean): Promise<{
-        message?: string;
-    }>;
-    /** All marks the viewer may see, each with `screenshot_url` resolved for display. */
-    list(): Promise<Annotation[]>;
-    /** Persist a new mark; returns its new id. */
-    save(input: NewAnnotation): Promise<{
-        id: number;
-    }>;
-    /** Patch a mark (status/note/type/priority) by id. */
-    update(patch: AnnotationPatch): Promise<void>;
-    /** Delete a mark (and its screenshot) by id. */
-    remove(id: number): Promise<void>;
-    /** Append a follow-up reply to a mark. */
-    addReply(id: number, note: string): Promise<void>;
-    /** Delete every done/dismissed mark (ADMIN/see-all cleanup). */
-    clearResolved(): Promise<{
-        message?: string;
-    }>;
-    /** Upload a screenshot; returns the storage path stored on the row (list() turns it into a URL). */
-    uploadScreenshot(file: File): Promise<{
-        path: string;
-    }>;
-}
-
-export type { Annotation as A, NewAnnotation as N, StorageAdapter as S, AnnShape as a, AnnPriority as b, AnnStatus as c, AnnType as d, AnnKind as e, AnnLog as f, AnnMeta as g, AnnPoint as h, AnnReply as i, AnnVisibility as j, AnnotateAccess as k, AnnotationPatch as l };
+export type { AnnotateAccess as A, NewAnnotation as N, Annotation as a, AnnotationPatch as b, AnnVisibility as c, AnnKind as d, AnnShape as e, AnnType as f, AnnPriority as g, AnnStatus as h };

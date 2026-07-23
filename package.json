@@ -1,10 +1,21 @@
 {
   "name": "annotate-kit",
   "version": "0.1.0",
-  "description": "Drop-in in-app annotation / visual-feedback overlay for React apps. Pin & draw on your live site, capture screenshots + console, export a clean prompt for your developer (Claude). Backend-agnostic via a small storage adapter — ships Supabase + Firebase adapters.",
+  "description": "Drop-in in-app annotation / visual-feedback overlay for React apps. Pin & draw on your live site, capture screenshots + console, export a clean prompt for your developer or any AI coding assistant. Backend-agnostic via a small storage adapter — ships zero-backend (localStorage), Supabase, Firebase, and generic REST adapters.",
   "type": "module",
   "license": "MIT",
   "author": "lavish-mitra",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lavish-mitra/annotate-kit.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lavish-mitra/annotate-kit/issues"
+  },
+  "homepage": "https://github.com/lavish-mitra/annotate-kit#readme",
+  "engines": {
+    "node": ">=18"
+  },
   "sideEffects": [
     "*.css"
   ],
@@ -27,17 +38,63 @@
       "types": "./dist/firebase.d.ts",
       "import": "./dist/firebase.js"
     },
+    "./local": {
+      "types": "./dist/local.d.ts",
+      "import": "./dist/local.js"
+    },
+    "./rest": {
+      "types": "./dist/rest.d.ts",
+      "import": "./dist/rest.js"
+    },
+    "./idb": {
+      "types": "./dist/idb.d.ts",
+      "import": "./dist/idb.js"
+    },
+    "./prompt": {
+      "types": "./dist/prompt.d.ts",
+      "import": "./dist/prompt.js"
+    },
+    "./delivery": {
+      "types": "./dist/delivery.d.ts",
+      "import": "./dist/delivery.js"
+    },
     "./styles.css": "./dist/annotate-kit.css"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "typesVersions": {
+    "*": {
+      "supabase": [
+        "./dist/supabase.d.ts"
+      ],
+      "firebase": [
+        "./dist/firebase.d.ts"
+      ],
+      "local": [
+        "./dist/local.d.ts"
+      ],
+      "rest": [
+        "./dist/rest.d.ts"
+      ],
+      "idb": [
+        "./dist/idb.d.ts"
+      ],
+      "prompt": [
+        "./dist/prompt.d.ts"
+      ],
+      "delivery": [
+        "./dist/delivery.d.ts"
+      ]
+    }
+  },
   "scripts": {
     "build": "npm run build:js && npm run build:css",
     "build:js": "tsup",
     "build:css": "tailwindcss -i ./src/styles/annotate.css -o ./dist/annotate-kit.css --minify",
     "dev": "tsup --watch",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
   },
   "peerDependencies": {
     "react": ">=18",
@@ -60,6 +117,7 @@
     "@tailwindcss/cli": "^4.0.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
+    "fake-indexeddb": "^6.2.5",
     "firebase": "^11.0.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
@@ -78,6 +136,8 @@
     "overlay",
     "supabase",
     "firebase",
-    "claude"
+    "rest",
+    "self-hosted",
+    "backend-agnostic"
   ]
 }

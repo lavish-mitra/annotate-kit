@@ -1,18 +1,22 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type CSSProperties } from 'react'
+import { Component, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type CSSProperties, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import { domToBlob } from 'modern-screenshot'
 import {
   X, Trash2, Copy, Download, Crosshair, MessageSquarePlus, Camera, ListChecks, CornerDownRight, Target,
   Eraser, Check, MapPin, Square, ArrowUpRight, Circle, Spline, Undo2, Eye, EyeOff, GripVertical, Maximize2,
-  Lock, Globe, Settings, Pencil, Keyboard, Send, Filter, Monitor, TerminalSquare, Trash,
+  Lock, Globe, Settings, Pencil, Keyboard, Send, Filter, Monitor, TerminalSquare, Trash, Highlighter,
 } from 'lucide-react'
 import type { StorageAdapter } from './adapter'
 import {
   ANN_TYPES, ANN_PRIORITIES, ANN_STATUSES, OPEN_STATUSES, ANN_MODES, ANN_COLORS, annDot, annTypeLabel,
   annStatusLabel, annShapeLabel,
 } from './constants'
-import { buildClaudePrompt } from './prompt'
+import { buildDevPrompt } from './prompt'
+import { sanitizeSnapshot } from './snapshot'
+import { ScreenshotEditor } from './ScreenshotEditor'
+import type { Delivery } from './delivery'
 import type {
-  Annotation, AnnType, AnnPriority, AnnStatus, AnnShape, AnnPoint, AnnVisibility, AnnMeta, AnnLog, AnnotateAccess,
+  Annotation, AnnType, AnnPriority, AnnStatus, AnnShape, AnnPoint, AnnVisibility, AnnMeta, AnnLog, AnnNetLog, AnnotateAccess,
 } from './types'
 
 export type AnnotateProps = {
@@ -30,36 +34,180 @@ export type AnnotateProps = {
   onToast?: (kind: 'success' | 'error', message: string) => void
   /** How often (ms) to refresh marks while the tool/panel is open. Default 15000. */
   pollMs?: number
+  /** Capture a rolling console/JS-error buffer with each mark (secrets may appear in logs).
+   *  Default false — opt in only if your team needs console context for bug reports. */
+  captureConsole?: boolean
+  /** Store the full URL (incl. query string + hash) instead of just origin + pathname.
+   *  Default false — query strings often carry tokens/PII. */
+  captureFullUrl?: boolean
+  /** Capture on-screen element text (target text + surrounding labels) with each mark.
+   *  Default true; set false for apps that display sensitive data. */
+  captureText?: boolean
+  /** Enable bare single-key tool shortcuts (P/B/A/C/D). Default true. Set false to avoid
+   *  collisions with the host app's own single-key shortcuts. */
+  singleKeyShortcuts?: boolean
+  /** Capture a rolling buffer of failed/slow network requests (fetch + XHR) with each mark.
+   *  Default false — URLs are trimmed + redacted, but opt in deliberately. */
+  captureNetwork?: boolean
+  /** Capture a sanitised HTML snapshot of the marked element (scripts/handlers stripped, password
+   *  values blanked, truncated). Default false — the DOM can contain sensitive content. */
+  captureDomSnapshot?: boolean
+  /** Blur password fields and any `[data-annot-redact]` element in screenshots. Default true. */
+  redactScreenshots?: boolean
+  /** Colour theme for the widget's own panels/dock: 'light' (default), 'dark', or 'auto'
+   *  (follows the OS via prefers-color-scheme). Does not affect the host page. */
+  theme?: 'light' | 'dark' | 'auto'
+  /** Override the brand accent colour (any valid CSS colour, e.g. '#0ea5e9'). Themes buttons, active
+   *  tools, links, and highlights. Invalid values are ignored. */
+  accent?: string
+  /** Redact secrets/PII from captured text + console before it is stored. Return the cleaned
+   *  string. Default masks JWTs, bearer tokens, emails, and long digit runs (cards/SSNs). */
+  redact?: (text: string) => string
+  /** Optional "send to…" targets shown in the Send panel (GitHub issue / webhook / Slack / your own).
+   *  Off by default — see the `githubIssueDelivery` / `createWebhookDelivery` / `createSlackDelivery` helpers. */
+  deliveries?: Delivery[]
 }
 
 type Tool = null | 'pin' | AnnShape
 const MODE_ICON: Record<string, typeof MapPin> = { pin: MapPin, rect: Square, arrow: ArrowUpRight, circle: Circle, freehand: Spline }
 const cn = (...a: (string | false | null | undefined)[]): string => a.filter(Boolean).join(' ')
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e))
+// Only ever render a URL we trust into href/src (blocks javascript:/vbscript: stored-XSS).
+const safeUrl = (u?: string | null): string | undefined => (u && /^(https?:|blob:|data:image\/(png|jpe?g|gif|webp|avif))/i.test(u) ? u : undefined)
+// A stored route is only safe to navigate to if it's a same-origin absolute path (not '//evil.com').
+const isSafePath = (p?: string | null): p is string => !!p && /^\/(?!\/)/.test(p)
+// A brand accent must be a plain CSS colour before we inject it into a <style> (prevents CSS injection).
+const safeColor = (c?: string): string | undefined => (c && /^(#[0-9a-fA-F]{3,8}|(?:rgb|rgba|hsl|hsla)\([\d%.,\s/]+\))$/.test(c.trim()) ? c.trim() : undefined)
+// Default redactor: mask common secrets/PII in captured text + console before it is persisted.
+const defaultRedact = (s: string): string => String(s ?? '')
+  .replace(/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}/g, '[redacted-jwt]')
+  .replace(/\b(bearer|token|api[_-]?key|secret|password|authorization)\b\s*[:=]?\s*[A-Za-z0-9._~+/=-]{6,}/gi, '$1 [redacted]')
+  .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, '[redacted-email]')
+  .replace(/\b(?:\d[ -]?){13,19}\b/g, '[redacted-number]')
+// Trap Tab focus inside an open dialog (a11y): focus the first control, cycle Tab within, restore on close.
+function useFocusTrap(active: boolean) {
+  const ref = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    if (!active) return
+    const el = ref.current
+    if (!el) return
+    const SEL = 'a[href],button:not([disabled]),input:not([disabled]),textarea:not([disabled]),select:not([disabled]),[tabindex]:not([tabindex="-1"])'
+    const list = () => Array.from(el.querySelectorAll<HTMLElement>(SEL)).filter((x) => x.offsetParent !== null)
+    const restore = document.activeElement as HTMLElement | null
+    const items = list()
+    ;(items[0] ?? el).focus()
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Tab') return
+      const f = list()
+      if (!f.length) return
+      const first = f[0], last = f[f.length - 1]
+      if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus() }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus() }
+    }
+    el.addEventListener('keydown', onKey)
+    return () => { el.removeEventListener('keydown', onKey); restore?.focus?.() }
+  }, [active])
+  return ref
+}
+
+// If the overlay itself throws while rendering a bad row, degrade to nothing rather than crash the host.
+class OverlayBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+  state = { failed: false }
+  static getDerivedStateFromError() { return { failed: true } }
+  componentDidCatch(e: unknown) { console.warn('[annotate] overlay render error', e) }
+  render() { return this.state.failed ? null : this.props.children }
+}
 
 // ---- module-level capture: environment + a rolling console/JS-error buffer (bug-report context) ----
-function captureEnv(): AnnMeta {
+function captureEnv(fullUrl: boolean): AnnMeta {
   const ua = navigator.userAgent
   const browser = /edg/i.test(ua) ? 'Edge' : /opr|opera/i.test(ua) ? 'Opera' : /chrome/i.test(ua) ? 'Chrome' : /firefox/i.test(ua) ? 'Firefox' : /safari/i.test(ua) ? 'Safari' : 'Browser'
   const os = /windows/i.test(ua) ? 'Windows' : /mac os|macintosh/i.test(ua) ? 'macOS' : /android/i.test(ua) ? 'Android' : /iphone|ipad|ios/i.test(ua) ? 'iOS' : /linux/i.test(ua) ? 'Linux' : 'OS'
   const device = /mobi/i.test(ua) ? 'Mobile' : /tablet|ipad/i.test(ua) ? 'Tablet' : 'Desktop'
-  return { browser, os, device, viewport: `${window.innerWidth}×${window.innerHeight}`, screen: `${window.screen?.width}×${window.screen?.height}`, dpr: Math.round((window.devicePixelRatio || 1) * 100) / 100, url: window.location.href, ua: ua.slice(0, 200) }
+  return { browser, os, device, viewport: `${window.innerWidth}×${window.innerHeight}`, screen: `${window.screen?.width}×${window.screen?.height}`, dpr: Math.round((window.devicePixelRatio || 1) * 100) / 100, url: fullUrl ? window.location.href : window.location.origin + window.location.pathname, ua: ua.slice(0, 200) }
 }
 const _logBuf: AnnLog[] = []
 let _logHooked = false
-function hookConsole() {
-  if (_logHooked || typeof window === 'undefined') return
+// Install the console/JS-error capture — ONLY when the tool is active and the integrator opts in.
+// Returns an uninstall fn that restores the original console (no permanent global monkeypatch at import).
+function hookConsole(redact: (s: string) => string): () => void {
+  if (_logHooked || typeof window === 'undefined') return () => {}
   _logHooked = true
-  const fmt = (args: unknown[]) => args.map((a) => typeof a === 'string' ? a : a instanceof Error ? (a.stack || a.message) : (() => { try { return JSON.stringify(a) } catch { return String(a) } })()).join(' ').slice(0, 500)
+  const fmt = (args: unknown[]) => redact(args.map((a) => typeof a === 'string' ? a : a instanceof Error ? (a.stack || a.message) : (() => { try { return JSON.stringify(a) } catch { return String(a) } })()).join(' ')).slice(0, 500)
   const push = (level: string, args: unknown[]) => { try { _logBuf.push({ level, text: fmt(args), at: new Date().toISOString() }); if (_logBuf.length > 50) _logBuf.shift() } catch { /* ignore */ } }
   const orig = { error: console.error, warn: console.warn }
-  console.error = (...a: unknown[]) => { push('error', a); orig.error(...a) }
-  console.warn = (...a: unknown[]) => { push('warn', a); orig.warn(...a) }
-  window.addEventListener('error', (e) => push('error', [e.message + (e.filename ? ` @ ${e.filename}:${e.lineno}:${e.colno}` : '')]))
-  window.addEventListener('unhandledrejection', (e) => push('error', ['Unhandled promise rejection: ' + String((e as PromiseRejectionEvent).reason)]))
+  const onErr = (e: ErrorEvent) => push('error', [e.message + (e.filename ? ` @ ${e.filename}:${e.lineno}:${e.colno}` : '')])
+  const onRej = (e: PromiseRejectionEvent) => push('error', ['Unhandled promise rejection: ' + String(e.reason)])
+  const errOverride = (...a: unknown[]) => { push('error', a); orig.error(...a) }
+  const warnOverride = (...a: unknown[]) => { push('warn', a); orig.warn(...a) }
+  console.error = errOverride
+  console.warn = warnOverride
+  window.addEventListener('error', onErr)
+  window.addEventListener('unhandledrejection', onRej)
+  return () => {
+    _logHooked = false
+    _logBuf.length = 0
+    if (console.error === errOverride) console.error = orig.error   // don't clobber a wrapper installed after us
+    if (console.warn === warnOverride) console.warn = orig.warn
+    window.removeEventListener('error', onErr)
+    window.removeEventListener('unhandledrejection', onRej)
+  }
 }
-if (typeof window !== 'undefined') hookConsole()
 const recentLogs = () => _logBuf.slice(-8)
+
+// ---- module-level network capture (opt-in): rolling buffer of failed/slow fetch + XHR calls ----
+const _netBuf: AnnNetLog[] = []
+let _netHooked = false
+function hookNetwork(redact: (s: string) => string): () => void {
+  if (_netHooked || typeof window === 'undefined' || typeof window.fetch !== 'function') return () => {}
+  _netHooked = true
+  const trim = (u: string) => { try { const x = new URL(u, location.href); return redact(x.origin + x.pathname) } catch { return redact(String(u).slice(0, 200)) } }
+  const record = (method: string, url: string, status: number | undefined, ms: number, ok: boolean) => {
+    if (ok && status !== undefined && status < 400 && ms < 2000) return   // keep only errors / failures / slow calls
+    try { _netBuf.push({ method, url: trim(url), status, ms: Math.round(ms), ok, at: new Date().toISOString() }); if (_netBuf.length > 50) _netBuf.shift() } catch { /* ignore */ }
+  }
+  const origFetch = window.fetch
+  const boundFetch = origFetch.bind(window)
+  const wrapped = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+    const start = Date.now()
+    const method = (init?.method || (input instanceof Request ? input.method : undefined) || 'GET').toUpperCase()
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : (input as Request).url
+    try { const res = await boundFetch(input, init); record(method, url, res.status, Date.now() - start, res.ok); return res }
+    catch (e) { record(method, url, undefined, Date.now() - start, false); throw e }
+  }
+  const wrappedFetch = wrapped as typeof window.fetch
+  window.fetch = wrappedFetch
+  const XHR = window.XMLHttpRequest
+  const origOpen = XHR.prototype.open
+  const origSend = XHR.prototype.send
+  const openOverride = function (this: XMLHttpRequest, method: string, url: string | URL, ...rest: any[]) {   // eslint-disable-line @typescript-eslint/no-explicit-any
+    ;(this as any).__annot = { method: String(method).toUpperCase(), url: String(url), start: 0 }   // eslint-disable-line @typescript-eslint/no-explicit-any
+    return (origOpen as any).call(this, method, url, ...rest)   // eslint-disable-line @typescript-eslint/no-explicit-any
+  } as typeof XHR.prototype.open
+  const sendOverride = function (this: XMLHttpRequest, ...args: any[]) {   // eslint-disable-line @typescript-eslint/no-explicit-any
+    const info = (this as any).__annot   // eslint-disable-line @typescript-eslint/no-explicit-any
+    if (info) { info.start = Date.now(); this.addEventListener('loadend', () => record(info.method, info.url, this.status || undefined, Date.now() - info.start, this.status >= 200 && this.status < 400), { once: true }) }
+    return (origSend as any).apply(this, args)   // eslint-disable-line @typescript-eslint/no-explicit-any
+  } as typeof XHR.prototype.send
+  XHR.prototype.open = openOverride
+  XHR.prototype.send = sendOverride
+  return () => {
+    _netHooked = false
+    _netBuf.length = 0
+    if (window.fetch === wrappedFetch) window.fetch = origFetch   // don't clobber a wrapper installed after us
+    if (XHR.prototype.open === openOverride) XHR.prototype.open = origOpen
+    if (XHR.prototype.send === sendOverride) XHR.prototype.send = origSend
+  }
+}
+const recentNet = () => _netBuf.slice(-8)
+
+// Temporarily blur password fields + [data-annot-redact] elements while a screenshot is captured.
+function maskForCapture(): () => void {
+  const els = Array.from(document.querySelectorAll<HTMLElement>('input[type="password" i], [data-annot-redact]'))
+  const prev = els.map((el) => el.style.filter)
+  els.forEach((el) => { el.style.filter = 'blur(10px)' })
+  return () => els.forEach((el, i) => { el.style.filter = prev[i] })
+}
 
 type Draft = {
   kind: 'pin' | 'shape'; shape_type?: AnnShape
@@ -67,7 +215,7 @@ type Draft = {
   pos_x: number; pos_y: number; x2?: number; y2?: number; points?: AnnPoint[]
   viewport_w: number; viewport_h: number
   note: string; type: AnnType; priority: AnnPriority; color: string; visibility: AnnVisibility; shot: boolean
-  styles?: Record<string, string> | null; el_context?: string[] | null; meta?: AnnMeta; console_logs?: AnnLog[]
+  styles?: Record<string, string> | null; el_context?: string[] | null; meta?: AnnMeta; console_logs?: AnnLog[]; network_logs?: AnnNetLog[]; dom_snapshot?: string | null
   cx: number; cy: number
 }
 type Drawing = { shape_type: AnnShape; x: number; y: number; x2: number; y2: number; points: AnnPoint[] } | null
@@ -167,12 +315,12 @@ function ShapeSvg({ s, dash }: { s: { shape_type?: string | null; pos_x: number;
       <line x1={x} y1={y} x2={x2} y2={y2} stroke={stroke} strokeWidth={sw + 0.5} strokeDasharray={d} markerEnd={`url(#${mid})`} />
     </>)
   }
-  return <polyline points={(s.points || []).map((p) => `${p.x},${p.y}`).join(' ')} fill="none" stroke={stroke} strokeWidth={sw} strokeLinejoin="round" strokeLinecap="round" strokeDasharray={d} />
+  return <polyline points={(Array.isArray(s.points) ? s.points : []).map((p) => `${p.x},${p.y}`).join(' ')} fill="none" stroke={stroke} strokeWidth={sw} strokeLinejoin="round" strokeLinecap="round" strokeDasharray={d} />
 }
 
 const chip = 'inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium'
 
-export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 15_000 }: AnnotateProps) {
+export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 15_000, captureConsole = false, captureFullUrl = false, captureText = true, singleKeyShortcuts = true, captureNetwork = false, captureDomSnapshot = false, redactScreenshots = true, theme = 'light', accent, redact, deliveries = [] }: AnnotateProps) {
   // --- route + navigation (framework-agnostic) ---
   const [browserPath, setBrowserPath] = useState(() => (typeof window !== 'undefined' ? window.location.pathname : '/'))
   useEffect(() => {
@@ -183,6 +331,8 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
   }, [route])
   const pathname = route ?? browserPath
   const navigate = useCallback((p: string) => { if (onNavigate) onNavigate(p); else window.location.assign(p) }, [onNavigate])
+  const redactFn = useCallback((s: string) => (redact ? redact(s) : defaultRedact(s)), [redact])
+  const accentCss = safeColor(accent)
 
   // --- built-in mini-toast (used only when onToast is not supplied) ---
   const [toasts, setToasts] = useState<{ id: number; kind: 'success' | 'error'; msg: string }[]>([])
@@ -210,6 +360,19 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
   const meEmail = me.email || ''
   const meName = me.name || me.email || 'me'
 
+  // Console/JS-error capture is installed lazily — only when the tool is usable AND opted in — and
+  // torn down on cleanup. No global console monkeypatch happens at import time.
+  useEffect(() => {
+    if (!canUse || !captureConsole) return
+    return hookConsole(redactFn)
+  }, [canUse, captureConsole, redactFn])
+
+  // Network capture — same lazy, opt-in, cleaned-up-on-unmount treatment as the console hook.
+  useEffect(() => {
+    if (!canUse || !captureNetwork) return
+    return hookNetwork(redactFn)
+  }, [canUse, captureNetwork, redactFn])
+
   const [tool, setTool] = useState<Tool>(null)
   const [color, setColor] = useState(ANN_COLORS[0])
   const [panel, setPanel] = useState(false)
@@ -217,7 +380,7 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
   const [drawing, setDrawing] = useState<Drawing>(null)
   const [active, setActive] = useState<Annotation | null>(null)
   const [busy, setBusy] = useState(false)
-  const [, setTick] = useState(0)
+  const [tick, setTick] = useState(0)
   const [flashId, setFlashId] = useState<number | null>(null)
   const [hoverEl, setHoverEl] = useState<HTMLElement | null>(null)
   const [filter, setFilter] = useState<'all' | AnnStatus>('all')
@@ -229,11 +392,26 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
   const [reply, setReply] = useState('')
   const [peek, setPeek] = useState(false)
   const [shotBusy, setShotBusy] = useState(false)
+  const [markupBlob, setMarkupBlob] = useState<Blob | null>(null)
+  const [delivering, setDelivering] = useState(false)
   const [sendOpen, setSendOpen] = useState(false)
   const [helpOpen, setHelpOpen] = useState(false)
+  const sendTrap = useFocusTrap(sendOpen)
+  const helpTrap = useFocusTrap(helpOpen)
+  const panelTrap = useFocusTrap(panel)
   const [editRow, setEditRow] = useState<number | null>(null)
   const [hintSeen, setHintSeen] = useState(() => { try { return localStorage.getItem('annot-hint') === '1' } catch { return true } })
-  const [pos, setPos] = useState<{ x: number; y: number } | null>(() => { try { return JSON.parse(localStorage.getItem('annot-pos') || 'null') } catch { return null } })
+  const [pos, setPos] = useState<{ x: number; y: number } | null>(() => {
+    try {
+      const p = JSON.parse(localStorage.getItem('annot-pos') || 'null')
+      if (p && Number.isFinite(p.x) && Number.isFinite(p.y)) {
+        const mx = (typeof window !== 'undefined' ? window.innerWidth : 9999) - 64
+        const my = (typeof window !== 'undefined' ? window.innerHeight : 9999) - 64
+        return { x: Math.min(Math.max(4, p.x), mx), y: Math.min(Math.max(4, p.y), my) }
+      }
+    } catch { /* ignore */ }
+    return null
+  })
 
   const draftElRef = useRef<HTMLElement | null>(null)
   const hoverRef = useRef<HTMLElement | null>(null)
@@ -247,16 +425,33 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
   }, [adapter])
   const invalidate = refresh
   useEffect(() => { if (canUse) refresh() }, [canUse, refresh])
+  // realtime subscription (adapters that support it) — NOT re-run on tool/panel toggles.
+  // Backstop is a refresh when the tab regains focus (no continuous polling while idle).
   useEffect(() => {
-    if (!canUse || !(tool || panel)) return
+    if (!canUse || !adapter.subscribe) return
+    const un = adapter.subscribe(() => { refresh() })
+    const onVis = () => { if (document.visibilityState === 'visible') refresh() }
+    document.addEventListener('visibilitychange', onVis)
+    return () => { un(); document.removeEventListener('visibilitychange', onVis) }
+  }, [canUse, adapter, refresh])
+  // fallback poll while the tool/panel is open (only for adapters without realtime)
+  useEffect(() => {
+    if (!canUse || adapter.subscribe || !(tool || panel)) return
     const id = setInterval(refresh, pollMs)
     return () => clearInterval(id)
-  }, [canUse, tool, panel, pollMs, refresh])
+  }, [canUse, tool, panel, pollMs, refresh, adapter])
 
   const openCount = all.filter((a) => OPEN_STATUSES.includes(a.status)).length
 
   const marksShown = !peek && (!!tool || panel || flashId != null)
   const pageMarks = useMemo(() => all.filter((a) => a.page_route === pathname && (OPEN_STATUSES.includes(a.status) || a.id === flashId)), [all, pathname, flashId])
+  // Resolve each visible pin's element ONCE per frame (keyed on scroll/resize tick) instead of
+  // re-running findEl (with its querySelectorAll fallback) on every render for every mark.
+  const markEls = useMemo(() => {
+    const m = new Map<number, HTMLElement | null>()
+    for (const a of pageMarks) m.set(a.id, a.kind === 'shape' ? null : findEl(a))
+    return m
+  }, [pageMarks, tick, pathname])   // eslint-disable-line react-hooks/exhaustive-deps
 
   const dismissHint = () => { setHintSeen(true); try { localStorage.setItem('annot-hint', '1') } catch { /* ignore */ } }
 
@@ -278,17 +473,17 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
       draftElRef.current = el; setHoverEl(el); setActive(null)
       setDraft({
         kind: 'pin', page_route: pathname, page_title: document.title || pathname,
-        target_selector: cssSelector(el), target_text: (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120),
+        target_selector: cssSelector(el), target_text: captureText ? redactFn((el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120)) : '',
         pos_x: Math.round(e.pageX), pos_y: Math.round(e.pageY), viewport_w: window.innerWidth, viewport_h: window.innerHeight,
-        note: '', type: 'change', priority: 'med', color, visibility: isAdmin ? 'private' : 'public', shot: false,
-        styles: captureStyles(el), el_context: captureContext(el), meta: captureEnv(), console_logs: recentLogs(),
+        note: '', type: 'change', priority: 'med', color, visibility: 'private', shot: false,
+        styles: captureStyles(el), el_context: captureText ? captureContext(el).map(redactFn) : [], meta: captureEnv(captureFullUrl), console_logs: captureConsole ? recentLogs() : [], network_logs: captureNetwork ? recentNet() : [], dom_snapshot: captureDomSnapshot ? redactFn(sanitizeSnapshot(el.outerHTML)) : null,
         cx: e.clientX, cy: e.clientY,
       })
     }
     document.addEventListener('mousemove', onMove, true)
     document.addEventListener('click', onClick, true)
     return () => { document.body.style.cursor = ''; document.removeEventListener('mousemove', onMove, true); document.removeEventListener('click', onClick, true) }
-  }, [tool, pathname, color, isAdmin])
+  }, [tool, pathname, color, isAdmin, canUse, captureText, captureFullUrl, captureConsole, captureNetwork, captureDomSnapshot, redactFn])
 
   // ---- SHAPE tools ----
   useEffect(() => {
@@ -321,8 +516,8 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
         target_selector: anchor && !anchor.closest('[data-annot-ui]') ? cssSelector(anchor) : '', target_text: '',
         pos_x: Math.round(d.x), pos_y: Math.round(d.y), x2: Math.round(d.x2), y2: Math.round(d.y2), points: d.shape_type === 'freehand' ? d.points : undefined,
         viewport_w: window.innerWidth, viewport_h: window.innerHeight,
-        note: '', type: 'change', priority: 'med', color, visibility: isAdmin ? 'private' : 'public', shot: false,
-        meta: captureEnv(), console_logs: recentLogs(), cx: e.clientX, cy: e.clientY,
+        note: '', type: 'change', priority: 'med', color, visibility: 'private', shot: false,
+        meta: captureEnv(captureFullUrl), console_logs: captureConsole ? recentLogs() : [], network_logs: captureNetwork ? recentNet() : [], cx: e.clientX, cy: e.clientY,
       })
     }
     document.addEventListener('pointerdown', onDown, true)
@@ -337,55 +532,85 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
       document.removeEventListener('pointercancel', onUp, true)
       drawRef.current = null; setDrawing(null)
     }
-  }, [tool, pathname, color, isAdmin])
+  }, [tool, pathname, color, isAdmin, canUse, captureText, captureFullUrl, captureConsole, captureNetwork, captureDomSnapshot, redactFn])
 
   useEffect(() => {
-    const on = () => setTick((x) => x + 1)
+    if (!canUse) return
+    let raf = 0
+    const on = () => { if (raf) return; raf = requestAnimationFrame(() => { raf = 0; setTick((x) => x + 1) }) }
     window.addEventListener('scroll', on, true); window.addEventListener('resize', on)
-    return () => { window.removeEventListener('scroll', on, true); window.removeEventListener('resize', on) }
-  }, [])
+    return () => { if (raf) cancelAnimationFrame(raf); window.removeEventListener('scroll', on, true); window.removeEventListener('resize', on) }
+  }, [canUse])
 
   useEffect(() => {
+    if (!canUse) return   // never attach global key handlers for a viewer who can't use the tool
     const h = (e: KeyboardEvent) => {
       const typing = /input|textarea|select/i.test((e.target as Element)?.tagName || '') || (e.target as HTMLElement)?.isContentEditable
-      if (e.key === 'Escape') { if (helpOpen) setHelpOpen(false); else if (draft) closeDraft(); else if (tool) setTool(null); return }
+      if (e.key === 'Escape') { if (helpOpen) setHelpOpen(false); else if (sendOpen) setSendOpen(false); else if (draft) closeDraft(); else if (panel) setPanel(false); else if (tool) setTool(null); return }
       if (typing) return
       const meta = e.ctrlKey || e.metaKey
       if (meta && e.key.toLowerCase() === 'z' && !e.shiftKey) { e.preventDefault(); undoLast(); return }
       if (e.key === '?') { e.preventDefault(); setHelpOpen((v) => !v); return }
       if (e.shiftKey && e.key.toLowerCase() === 'h') { e.preventDefault(); setPeek((v) => !v); return }
       if (e.shiftKey && e.key.toLowerCase() === 'a') { e.preventDefault(); setTool((m) => (m === 'pin' ? null : 'pin')); return }
+      if (!singleKeyShortcuts) return   // bare-letter tool hotkeys are opt-out (avoid host-app collisions)
       const map: Record<string, Tool> = { p: 'pin', b: 'rect', a: 'arrow', c: 'circle', d: 'freehand' }
       const t = map[e.key.toLowerCase()]
       if (t && !e.shiftKey && !meta) { e.preventDefault(); setTool((cur) => (cur === t ? null : t)) }
     }
     document.addEventListener('keydown', h)
     return () => document.removeEventListener('keydown', h)
-  }, [tool, draft, helpOpen])   // eslint-disable-line react-hooks/exhaustive-deps
+  }, [tool, draft, helpOpen, sendOpen, panel, canUse, singleKeyShortcuts])   // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => { if (active) { const f = all.find((a) => a.id === active.id); if (f && f !== active) setActive(f) } }, [all])   // eslint-disable-line react-hooks/exhaustive-deps
 
-  async function uploadShot(el: HTMLElement): Promise<string | null> {
+  async function uploadShot(el: HTMLElement, visibility: AnnVisibility): Promise<string | null> {
+    const unmask = redactScreenshots ? maskForCapture() : () => {}
+    let blob: Blob | null = null
+    try { blob = await domToBlob(el, { backgroundColor: '#ffffff', scale: 2, quality: 0.95, style: { margin: '0' } }) }
+    catch (e) { console.warn('[annotate] screenshot failed', e) }
+    finally { unmask() }
     try {
-      const blob = await domToBlob(el, { backgroundColor: '#ffffff', scale: 2, quality: 0.95, style: { margin: '0' } })
       if (!blob) return null
       const shot = new File([blob], 'shot.png', { type: blob.type || 'image/png' })
-      const { path } = await adapter.uploadScreenshot(shot)
+      const { path } = await adapter.uploadScreenshot(shot, { visibility })
       return path
     } catch (e) { console.warn('[annotate] screenshot failed', e); return null }
+  }
+
+  async function captureBlob(full: boolean): Promise<Blob | null> {
+    await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
+    const target = full ? document.body : document.documentElement
+    const pageW = full ? Math.max(document.documentElement.scrollWidth, window.innerWidth) : window.innerWidth
+    const pageH = full ? Math.max(document.documentElement.scrollHeight, window.innerHeight) : window.innerHeight
+    let scale = Math.min(2, window.devicePixelRatio || 1)
+    // stay under browser canvas limits — cap total area AND each dimension (~16k px hard cap)
+    while (scale > 0.5 && (pageW * pageH * scale * scale > 24_000_000 || pageW * scale > 16000 || pageH * scale > 16000)) scale -= 0.5
+    const unmask = redactScreenshots ? maskForCapture() : () => {}
+    try {
+      return await domToBlob(target, {
+        backgroundColor: '#ffffff', scale,
+        width: full ? undefined : window.innerWidth, height: full ? undefined : window.innerHeight,
+        filter: (n: Node) => !(n instanceof HTMLElement && n.hasAttribute('data-annot-ui')),
+      })
+    } finally { unmask() }
+  }
+
+  async function startMarkup() {
+    if (shotBusy) return
+    setShotBusy(true)
+    try {
+      const blob = await captureBlob(false)
+      if (!blob) throw new Error('capture failed')
+      setMarkupBlob(blob)
+    } catch (e) { toast('error', errMsg(e) || 'Capture failed') } finally { setShotBusy(false) }
   }
 
   async function capturePage(full: boolean) {
     if (shotBusy) return
     setShotBusy(true)
     try {
-      await new Promise((r) => requestAnimationFrame(() => setTimeout(r, 40)))
-      const target = full ? document.body : document.documentElement
-      const blob = await domToBlob(target, {
-        backgroundColor: '#ffffff', scale: Math.min(2, window.devicePixelRatio || 1),
-        width: full ? undefined : window.innerWidth, height: full ? undefined : window.innerHeight,
-        filter: (n: Node) => !(n instanceof HTMLElement && n.hasAttribute('data-annot-ui')),
-      })
+      const blob = await captureBlob(full)
       if (!blob) throw new Error('capture failed')
       const canClip = !!navigator.clipboard && typeof window.ClipboardItem === 'function'
       if (canClip) { try { await navigator.clipboard.write([new window.ClipboardItem({ 'image/png': blob })]); toast('success', `${full ? 'Full page' : 'Viewport'} copied — paste anywhere`); return } catch { /* download */ } }
@@ -402,7 +627,7 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
     setBusy(true)
     try {
       let screenshot_path: string | null = null
-      if (draft.shot && draftElRef.current) { screenshot_path = await uploadShot(draftElRef.current); if (!screenshot_path) toast('error', 'Screenshot failed — saved without it') }
+      if (draft.shot && draftElRef.current) { screenshot_path = await uploadShot(draftElRef.current, draft.visibility); if (!screenshot_path) toast('error', 'Screenshot failed — saved without it') }
       const { cx: _cx, cy: _cy, shot: _shot, ...body } = draft   // eslint-disable-line @typescript-eslint/no-unused-vars
       const saved = await adapter.save({ ...body, screenshot_path })
       if (saved?.id) { undoStackRef.current.push(saved.id); if (undoStackRef.current.length > 30) undoStackRef.current.shift() }
@@ -430,14 +655,20 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
       else window.scrollTo({ top: Math.max(0, a.pos_y - 140), behavior: 'smooth' })
       setActive(a); setFlashId(a.id); setTimeout(() => setFlashId(null), 4000)
     }
-    if (a.page_route !== pathname) { setPanel(false); navigate(a.page_route); setTimeout(go, 400) } else go()
+    if (a.page_route !== pathname && isSafePath(a.page_route)) { setPanel(false); navigate(a.page_route); setTimeout(go, 400) } else go()
   }
 
-  const copyPrompt = async (items: Annotation[]) => { try { await navigator.clipboard.writeText(buildClaudePrompt(items)); toast('success', `Copied ${items.length} mark(s) — paste to your developer`) } catch { toast('error', 'Clipboard blocked — use Download') } }
+  const copyPrompt = async (items: Annotation[]) => { try { await navigator.clipboard.writeText(buildDevPrompt(items)); toast('success', `Copied ${items.length} mark(s) — paste to your developer`) } catch { toast('error', 'Clipboard blocked — use Download') } }
   const downloadMd = (items: Annotation[]) => {
-    const blob = new Blob([buildClaudePrompt(items)], { type: 'text/markdown;charset=utf-8' })
+    const blob = new Blob([buildDevPrompt(items)], { type: 'text/markdown;charset=utf-8' })
     const url = URL.createObjectURL(blob); const a = document.createElement('a')
-    a.href = url; a.download = `annotations-${new Date().toISOString().slice(0, 10)}.md`; a.click(); URL.revokeObjectURL(url)
+    a.href = url; a.download = `annotations-${new Date().toISOString().slice(0, 10)}.md`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
+  const doDeliver = async (d: Delivery) => {
+    if (delivering || !d.run) return
+    setDelivering(true)
+    try { await d.run(openItems); toast('success', `Sent to ${d.label}`); setSendOpen(false) }
+    catch (e) { toast('error', errMsg(e)) } finally { setDelivering(false) }
   }
 
   const canEdit = (a: Annotation) => seeAll || a.created_by === meEmail || a.created_by === meName
@@ -473,14 +704,16 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
 
   if (accessLoading || !canUse) return null
 
-  const highlightEl = draft?.kind === 'pin' ? draftElRef.current : (hoverEl || (active && active.page_route === pathname ? findEl(active) : null))
+  const highlightEl = draft?.kind === 'pin' ? draftElRef.current : (hoverEl || (active && active.page_route === pathname ? (markEls.get(active.id) ?? findEl(active)) : null))
   const highlightTone = draft ? annDot(draft.type) : active ? annDot(active.type) : '#6366f1'
   const docW = Math.max(document.documentElement.scrollWidth, window.innerWidth)
   const docH = Math.max(document.documentElement.scrollHeight, window.innerHeight)
   const fabStyle: CSSProperties = pos ? { position: 'fixed', left: pos.x, top: pos.y } : { position: 'fixed', right: 20, bottom: 20 }
 
-  return (
-    <div data-annot-ui>
+  return createPortal(
+    <OverlayBoundary key={pathname}>
+    {accentCss && <style data-annot-ui>{`[data-annot-ui],[data-annot-ui][data-annot-theme="dark"],[data-annot-theme="dark"] [data-annot-ui]{--color-brand:${accentCss};--color-brand-strong:${accentCss};--color-brand-tint:color-mix(in srgb, ${accentCss} 14%, transparent);--color-brand-hairline:color-mix(in srgb, ${accentCss} 32%, transparent);}`}</style>}
+    <div data-annot-ui data-annot-theme={theme}>
       <Highlight el={highlightEl} tone={highlightTone} label={highlightEl ? elLabel(highlightEl) : undefined} />
 
       {marksShown && (
@@ -496,7 +729,7 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
       )}
 
       {marksShown && pageMarks.map((a, i) => {
-        const el = a.kind === 'shape' ? null : findEl(a)
+        const el = markEls.get(a.id) ?? null
         const r = el?.getBoundingClientRect()
         const left = r ? r.left : a.pos_x - window.scrollX
         const top = r ? r.top : a.pos_y - window.scrollY
@@ -518,11 +751,11 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
             {!hintSeen && (
               <div data-annot-ui className="max-w-[220px] rounded-card bg-fg px-3 py-2 text-[11px] text-white shadow-e4">
                 <b>Feedback tool</b> — tap here, then click any element or draw to leave a note for the developer.
-                <button type="button" onClick={dismissHint} className="mt-1 block text-[10px] font-semibold text-brand">Got it</button>
+                <button type="button" onClick={dismissHint} className="mt-1 block text-[10px] font-semibold text-brand-strong">Got it</button>
               </div>
             )}
-            <button type="button" data-annot-ui onPointerDown={(e) => beginDrag(e, () => setTool('pin'))} title="Annotate · drag to move · Shift+A" style={{ touchAction: 'none' }}
-              className="relative grid h-12 w-12 place-items-center rounded-full bg-fg text-white shadow-e4 transition hover:bg-fg-secondary cursor-grab active:cursor-grabbing">
+            <button type="button" data-annot-ui aria-label="Open feedback tool" onPointerDown={(e) => beginDrag(e, () => setTool('pin'))} title="Annotate · drag to move · Shift+A" style={{ touchAction: 'none' }}
+              className="relative grid h-12 w-12 place-items-center rounded-full bg-fg text-white shadow-e4 transition hover:bg-ink-hover cursor-grab active:cursor-grabbing">
               <MessageSquarePlus size={20} />
               {openCount > 0 && <span className="absolute -right-1 -top-1 grid h-5 min-w-5 place-items-center rounded-full bg-brand px-1 text-[10px] font-bold text-white ring-2 ring-white">{openCount}</span>}
             </button>
@@ -532,12 +765,13 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
             <div className="flex items-center gap-1 bg-fg px-2 py-1.5 text-white">
               <button type="button" onPointerDown={(e) => beginDrag(e)} title="Drag" style={{ touchAction: 'none' }} className="cursor-grab p-1 text-fg-disabled hover:text-white active:cursor-grabbing"><GripVertical size={14} /></button>
               <span className="flex-1 truncate text-[12px] font-bold">Feedback ({all.length})</span>
-              <button type="button" onClick={() => setPeek((v) => !v)} title={peek ? 'Show marks (Shift+H)' : 'Hide marks (Shift+H)'} className="rounded p-1 text-fg-disabled hover:bg-fg-secondary hover:text-white">{peek ? <EyeOff size={15} /> : <Eye size={15} />}</button>
-              <button type="button" onClick={undoLast} title="Undo (Ctrl+Z)" className="rounded p-1 text-fg-disabled hover:bg-fg-secondary hover:text-white"><Undo2 size={15} /></button>
-              <button type="button" onClick={() => capturePage(false)} disabled={shotBusy} title="Viewport screenshot" className="rounded p-1 text-fg-disabled hover:bg-fg-secondary hover:text-white disabled:opacity-40"><Camera size={15} className={shotBusy ? 'animate-pulse' : ''} /></button>
-              <button type="button" onClick={() => capturePage(true)} disabled={shotBusy} title="Full-page screenshot" className="rounded p-1 text-fg-disabled hover:bg-fg-secondary hover:text-white disabled:opacity-40"><Maximize2 size={15} className={shotBusy ? 'animate-pulse' : ''} /></button>
-              <button type="button" onClick={() => setHelpOpen(true)} title="Shortcuts (?)" className="rounded p-1 text-fg-disabled hover:bg-fg-secondary hover:text-white"><Keyboard size={15} /></button>
-              <button type="button" onClick={() => { setTool(null); closeDraft() }} title="Close" className="rounded p-1 text-fg-disabled hover:bg-fg-secondary hover:text-white"><X size={15} /></button>
+              <button type="button" onClick={() => setPeek((v) => !v)} title={peek ? 'Show marks (Shift+H)' : 'Hide marks (Shift+H)'} className="rounded p-1 text-fg-disabled hover:bg-ink-hover hover:text-white">{peek ? <EyeOff size={15} /> : <Eye size={15} />}</button>
+              <button type="button" onClick={undoLast} title="Undo (Ctrl+Z)" className="rounded p-1 text-fg-disabled hover:bg-ink-hover hover:text-white"><Undo2 size={15} /></button>
+              <button type="button" onClick={() => capturePage(false)} disabled={shotBusy} title="Viewport screenshot" className="rounded p-1 text-fg-disabled hover:bg-ink-hover hover:text-white disabled:opacity-40"><Camera size={15} className={shotBusy ? 'animate-pulse' : ''} /></button>
+              <button type="button" onClick={() => capturePage(true)} disabled={shotBusy} title="Full-page screenshot" className="rounded p-1 text-fg-disabled hover:bg-ink-hover hover:text-white disabled:opacity-40"><Maximize2 size={15} className={shotBusy ? 'animate-pulse' : ''} /></button>
+              <button type="button" onClick={startMarkup} disabled={shotBusy} title="Screenshot & mark up" className="rounded p-1 text-fg-disabled hover:bg-ink-hover hover:text-white disabled:opacity-40"><Highlighter size={15} className={shotBusy ? 'animate-pulse' : ''} /></button>
+              <button type="button" onClick={() => setHelpOpen(true)} title="Shortcuts (?)" className="rounded p-1 text-fg-disabled hover:bg-ink-hover hover:text-white"><Keyboard size={15} /></button>
+              <button type="button" onClick={() => { setTool(null); closeDraft() }} title="Close" className="rounded p-1 text-fg-disabled hover:bg-ink-hover hover:text-white"><X size={15} /></button>
             </div>
             <div className="space-y-2 p-2">
               <div className="grid grid-cols-5 gap-1">
@@ -552,13 +786,13 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
                 })}
               </div>
               <div className="flex items-center gap-1.5">
-                {ANN_COLORS.map((c) => (<button key={c} type="button" onClick={() => setColor(c)} style={{ background: c }} title="Colour" className={cn('h-5 w-5 rounded-full border-2 transition', color === c ? 'scale-110 border-fg' : 'border-line')} />))}
+                {ANN_COLORS.map((c) => (<button key={c} type="button" onClick={() => setColor(c)} style={{ background: c }} title="Colour" className={cn('h-5 w-5 rounded-full border-2 transition', color === c ? 'scale-110 border-fg-secondary' : 'border-line')} />))}
                 {peek && <span className="ml-auto rounded bg-warning-tint px-1.5 py-0.5 text-[10px] font-bold text-warning-text ring-1 ring-warning-hairline">Peek</span>}
               </div>
-              {tool && (<div className="flex items-center gap-1.5 rounded-input bg-brand-tint px-2 py-1 text-[11px] font-semibold text-brand-strong ring-1 ring-brand-hairline"><Crosshair size={12} /> {tool === 'pin' ? 'Hover an element & click' : 'Drag to draw'} <span className="ml-auto text-brand">Esc</span></div>)}
+              {tool && (<div className="flex items-center gap-1.5 rounded-input bg-brand-tint px-2 py-1 text-[11px] font-semibold text-brand-strong ring-1 ring-brand-hairline"><Crosshair size={12} /> {tool === 'pin' ? 'Hover an element & click' : 'Drag to draw'} <span className="ml-auto text-brand-strong">Esc</span></div>)}
               <div className="flex gap-1.5">
                 <button type="button" onClick={() => setPanel(true)} className="inline-flex flex-1 items-center justify-center gap-1 rounded-input border border-line py-1.5 text-[12px] font-bold text-fg-secondary hover:bg-row-alt"><ListChecks size={14} /> Review</button>
-                <button type="button" onClick={() => setSendOpen(true)} disabled={!openItems.length} className="inline-flex flex-1 items-center justify-center gap-1 rounded-input bg-fg py-1.5 text-[12px] font-bold text-white hover:bg-fg-secondary disabled:opacity-40"><Send size={14} /> Send</button>
+                <button type="button" onClick={() => setSendOpen(true)} disabled={!openItems.length} className="inline-flex flex-1 items-center justify-center gap-1 rounded-input bg-fg py-1.5 text-[12px] font-bold text-white hover:bg-ink-hover disabled:opacity-40"><Send size={14} /> Send</button>
               </div>
             </div>
           </div>
@@ -582,6 +816,7 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
             {draft.styles?.color && <span className={cn(chip, 'bg-sunken')}><span className="h-2 w-2 rounded-full" style={{ background: draft.styles.color }} /> text</span>}
             {draft.meta && <span className={cn(chip, 'bg-sunken')}><Monitor size={10} /> {draft.meta.browser} · {draft.meta.viewport}</span>}
             {!!draft.console_logs?.length && <span className={cn(chip, 'bg-danger-tint text-danger-text')}><TerminalSquare size={10} /> {draft.console_logs.length} log</span>}
+            {!!draft.network_logs?.length && <span className={cn(chip, 'bg-warning-tint text-warning-text')}><Globe size={10} /> {draft.network_logs.length} net</span>}
           </div>
           <textarea autoFocus rows={3} value={draft.note} onChange={(e) => setDraft({ ...draft, note: e.target.value })}
             onKeyDown={(e) => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') submitDraft() }}
@@ -641,7 +876,19 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
               <div className="mt-1 max-h-28 space-y-0.5 overflow-y-auto font-mono">{active.console_logs.slice(-8).map((l, i) => <div key={i} className="truncate" title={l.text}><span className="text-rose-400">[{l.level}]</span> {l.text}</div>)}</div>
             </details>
           )}
-          {active.screenshot_url && <a href={active.screenshot_url} target="_blank" rel="noreferrer" className="mt-2 block"><img src={active.screenshot_url} alt="screenshot" className="max-h-44 w-full rounded-input border border-line object-contain" /></a>}
+          {!!active.network_logs?.length && (
+            <details className="mt-2 rounded-input bg-fg p-2 text-[10px] text-white">
+              <summary className="cursor-pointer font-semibold text-amber-300">Network ({active.network_logs.length})</summary>
+              <div className="mt-1 max-h-28 space-y-0.5 overflow-y-auto font-mono">{active.network_logs.slice(-8).map((nl, i) => <div key={i} className="truncate" title={nl.url}><span className="text-amber-400">{nl.method}</span> {nl.url} → {nl.status ?? 'ERR'}</div>)}</div>
+            </details>
+          )}
+          {active.dom_snapshot && (
+            <details className="mt-2 rounded-input bg-fg p-2 text-[10px] text-white">
+              <summary className="cursor-pointer font-semibold text-sky-300">DOM snapshot</summary>
+              <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap font-mono text-[9px] leading-snug">{active.dom_snapshot}</pre>
+            </details>
+          )}
+          {safeUrl(active.screenshot_url) && <a href={safeUrl(active.screenshot_url)} target="_blank" rel="noreferrer" className="mt-2 block"><img src={safeUrl(active.screenshot_url)} alt="screenshot" className="max-h-44 w-full rounded-input border border-line object-contain" /></a>}
           {(active.replies ?? []).length > 0 && (
             <div className="mt-2 space-y-1 border-t border-line pt-2">{(active.replies ?? []).map((r, i) => <p key={i} className="flex items-start gap-1 text-xs text-fg-muted"><CornerDownRight size={12} className="mt-0.5 shrink-0 text-fg-disabled" /> <span><b className="text-fg-muted">{r.author || ''}</b> {r.note}</span></p>)}</div>
           )}
@@ -656,9 +903,9 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
       {panel && (
         <>
           <div data-annot-ui className="fixed inset-0 z-[9998] bg-fg/20" onClick={() => setPanel(false)} />
-          <div data-annot-ui className="fixed right-0 top-0 z-[9999] flex h-full w-[27rem] max-w-[94vw] flex-col border-l border-line bg-surface shadow-e4">
+          <div ref={panelTrap} tabIndex={-1} data-annot-ui role="dialog" aria-modal="true" aria-label="Annotations" className="fixed right-0 top-0 z-[9999] flex h-full w-[27rem] max-w-[94vw] flex-col border-l border-line bg-surface shadow-e4 outline-none">
             <div className="flex items-center justify-between border-b border-line px-4 py-3">
-              <span className="flex items-center gap-2 font-bold text-fg-secondary"><ListChecks size={18} className="text-brand" /> Annotations <span className="rounded-full bg-sunken px-2 text-xs text-fg-muted">{anyFilter ? `${listed.length}/${all.length}` : all.length}</span></span>
+              <span className="flex items-center gap-2 font-bold text-fg-secondary"><ListChecks size={18} className="text-brand-strong" /> Annotations <span className="rounded-full bg-sunken px-2 text-xs text-fg-muted">{anyFilter ? `${listed.length}/${all.length}` : all.length}</span></span>
               <button type="button" onClick={() => setPanel(false)} className="text-fg-muted hover:text-fg-secondary"><X size={18} /></button>
             </div>
             <div className="flex items-center gap-2 border-b border-line px-3 py-2">
@@ -681,7 +928,7 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
                 {ANN_TYPES.map((t) => (<button key={t.key} type="button" onClick={() => setTypeFilter((v) => v === t.key ? '' : t.key)} className={cn('inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium ring-1', typeFilter === t.key ? 'bg-fg text-white ring-fg' : 'bg-surface text-fg-muted ring-line hover:bg-row-alt')}><span className="h-1.5 w-1.5 rounded-full" style={{ background: t.dot }} />{t.label}</button>))}
               </div>
               <div className="flex flex-wrap items-center gap-1">
-                {ANN_PRIORITIES.map((pr) => (<button key={pr.key} type="button" onClick={() => setPrioFilter((v) => v === pr.key ? '' : pr.key)} className={cn('rounded-full px-2 py-0.5 text-[11px] font-semibold ring-1', prioFilter === pr.key ? 'bg-fg-secondary text-white ring-fg-secondary' : 'bg-surface text-fg-muted ring-line hover:bg-row-alt')}>{pr.label}</button>))}
+                {ANN_PRIORITIES.map((pr) => (<button key={pr.key} type="button" onClick={() => setPrioFilter((v) => v === pr.key ? '' : pr.key)} className={cn('rounded-full px-2 py-0.5 text-[11px] font-semibold ring-1', prioFilter === pr.key ? 'bg-ink-hover text-white ring-fg-secondary' : 'bg-surface text-fg-muted ring-line hover:bg-row-alt')}>{pr.label}</button>))}
                 <label className="ml-1 inline-flex cursor-pointer items-center gap-1 text-[11px] font-medium text-fg-muted"><input type="checkbox" checked={thisPageOnly} onChange={(e) => setThisPageOnly(e.target.checked)} className="h-3 w-3" /> This page</label>
                 {seeAll && <button type="button" onClick={() => doClearResolved()} title="Delete done/dismissed" className="ml-auto inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] text-danger-text hover:bg-danger-tint"><Eraser size={11} /> Clear resolved</button>}
               </div>
@@ -747,16 +994,19 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
       {/* ---------------- send preview modal ---------------- */}
       {sendOpen && (
         <div data-annot-ui className="fixed inset-0 z-[10000] grid place-items-center bg-fg/50 p-4" onClick={() => setSendOpen(false)}>
-          <div className="flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden rounded-modal bg-surface shadow-e4" onClick={(e) => e.stopPropagation()}>
+          <div ref={sendTrap} tabIndex={-1} role="dialog" aria-modal="true" aria-label="Send to developer" className="flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden rounded-modal bg-surface shadow-e4 outline-none" onClick={(e) => e.stopPropagation()}>
             <div className="flex items-center gap-2 border-b border-line px-4 py-3">
-              <Send size={16} className="text-fg" /><span className="flex-1 text-sm font-bold text-fg">Send to developer — {openItems.length} open item(s)</span>
-              <button type="button" onClick={() => setSendOpen(false)} className="text-fg-muted hover:text-fg"><X size={18} /></button>
+              <Send size={16} className="text-fg-secondary" /><span className="flex-1 text-sm font-bold text-fg-secondary">Send to developer — {openItems.length} open item(s)</span>
+              <button type="button" onClick={() => setSendOpen(false)} className="text-fg-muted hover:text-fg-secondary"><X size={18} /></button>
             </div>
             <p className="px-4 pt-3 text-[12px] text-fg-muted">This exact markdown reaches your developer — each mark's element, note, environment, and console are included. Copy, then paste in the chat.</p>
-            <pre className="m-4 flex-1 overflow-auto whitespace-pre-wrap rounded-input bg-fg p-3 font-mono text-[11.5px] leading-relaxed text-white">{buildClaudePrompt(openItems) || '(no open marks)'}</pre>
-            <div className="flex items-center justify-end gap-2 border-t border-line p-3">
+            <pre className="m-4 flex-1 overflow-auto whitespace-pre-wrap rounded-input bg-fg p-3 font-mono text-[11.5px] leading-relaxed text-white">{buildDevPrompt(openItems) || '(no open marks)'}</pre>
+            <div className="flex flex-wrap items-center justify-end gap-2 border-t border-line p-3">
+              {deliveries.map((d, i) => d.href
+                ? <a key={i} href={safeUrl(d.href(openItems))} target="_blank" rel="noreferrer" onClick={() => setSendOpen(false)} className="inline-flex items-center gap-1.5 rounded-input border border-line-strong px-3 py-2 text-[12.5px] font-bold text-fg-secondary hover:bg-sunken"><Send size={14} /> {d.label}</a>
+                : <button key={i} type="button" disabled={delivering} onClick={() => doDeliver(d)} className="inline-flex items-center gap-1.5 rounded-input border border-line-strong px-3 py-2 text-[12.5px] font-bold text-fg-secondary hover:bg-sunken disabled:opacity-40"><Send size={14} /> {d.label}</button>)}
               <button type="button" onClick={() => downloadMd(openItems)} className="inline-flex items-center gap-1.5 rounded-input border border-line-strong px-4 py-2 text-[12.5px] font-bold text-fg-secondary hover:bg-sunken"><Download size={15} /> Download .md</button>
-              <button type="button" onClick={() => { copyPrompt(openItems); setSendOpen(false) }} className="inline-flex items-center gap-1.5 rounded-input bg-fg px-4 py-2 text-[12.5px] font-bold text-white hover:bg-fg-secondary"><Copy size={15} /> Copy — paste to developer</button>
+              <button type="button" onClick={() => { copyPrompt(openItems); setSendOpen(false) }} className="inline-flex items-center gap-1.5 rounded-input bg-fg px-4 py-2 text-[12.5px] font-bold text-white hover:bg-ink-hover"><Copy size={15} /> Copy — paste to developer</button>
             </div>
           </div>
         </div>
@@ -765,8 +1015,8 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
       {/* ---------------- keyboard cheat-sheet ---------------- */}
       {helpOpen && (
         <div data-annot-ui className="fixed inset-0 z-[10000] grid place-items-center bg-fg/50 p-4" onClick={() => setHelpOpen(false)}>
-          <div className="w-full max-w-sm rounded-modal bg-surface p-4 shadow-e4" onClick={(e) => e.stopPropagation()}>
-            <div className="mb-2 flex items-center gap-2"><Keyboard size={16} className="text-brand" /><span className="flex-1 text-sm font-bold text-fg-secondary">Shortcuts</span><button type="button" onClick={() => setHelpOpen(false)} className="text-fg-muted hover:text-fg-secondary"><X size={16} /></button></div>
+          <div ref={helpTrap} tabIndex={-1} role="dialog" aria-modal="true" aria-label="Keyboard shortcuts" className="w-full max-w-sm rounded-modal bg-surface p-4 shadow-e4 outline-none" onClick={(e) => e.stopPropagation()}>
+            <div className="mb-2 flex items-center gap-2"><Keyboard size={16} className="text-brand-strong" /><span className="flex-1 text-sm font-bold text-fg-secondary">Shortcuts</span><button type="button" onClick={() => setHelpOpen(false)} className="text-fg-muted hover:text-fg-secondary"><X size={16} /></button></div>
             <div className="grid grid-cols-2 gap-y-1.5 text-[12px] text-fg-muted">
               {[['Shift+A', 'Pin tool'], ['P / B / A / C / D', 'Pin · Box · Arrow · Circle · Draw'], ['Esc', 'Cancel / exit'], ['⌘/Ctrl+Enter', 'Save note'], ['Ctrl+Z', 'Undo last mark'], ['Shift+H', 'Hide / show marks'], ['?', 'This help']].map(([k, v]) => (
                 <div key={k} className="contents"><kbd className="w-fit rounded bg-sunken px-1.5 py-0.5 font-mono text-[11px] font-semibold text-fg-secondary">{k}</kbd><span>{v}</span></div>
@@ -775,6 +1025,8 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
           </div>
         </div>
       )}
+
+      {markupBlob && <ScreenshotEditor blob={markupBlob} onToast={toast} onClose={() => setMarkupBlob(null)} />}
 
       {/* ---------------- built-in mini-toast (skipped when onToast is provided) ---------------- */}
       {toasts.length > 0 && (
@@ -785,5 +1037,7 @@ export function Annotate({ adapter, route, onNavigate, user, onToast, pollMs = 1
         </div>
       )}
     </div>
+    </OverlayBoundary>,
+    document.body,
   )
 }

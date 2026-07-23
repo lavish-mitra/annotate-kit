@@ -1,0 +1,22 @@
+{
+  "//": "annotate-kit — composite indexes so non-admin list() can order newest-first while filtering. Deploy with:  firebase deploy --only firestore:indexes  (rename 'annotations' if you set collectionPath).",
+  "indexes": [
+    {
+      "collectionGroup": "annotations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "visibility", "order": "ASCENDING" },
+        { "fieldPath": "id", "order": "DESCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "annotations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "created_by", "order": "ASCENDING" },
+        { "fieldPath": "id", "order": "DESCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

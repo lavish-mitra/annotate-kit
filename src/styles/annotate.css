@@ -26,6 +26,7 @@
   --color-fg-secondary: #334155;
   --color-fg-muted: #64748b;
   --color-fg-disabled: #94a3b8;
+  --color-ink-hover: #334155;
 
   --color-line: #e9eef5;
   --color-line-strong: #d8e0ea;
@@ -81,6 +82,7 @@
   font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
   line-height: 1.4;
   -webkit-font-smoothing: antialiased;
+  color: var(--color-fg-secondary);   /* base text colour — inputs inherit this, so typed text stays readable in every theme */
 
   --color-canvas: #f6f8fb;
   --color-surface: #ffffff;
@@ -90,6 +92,7 @@
   --color-fg-secondary: #334155;
   --color-fg-muted: #64748b;
   --color-fg-disabled: #94a3b8;
+  --color-ink-hover: #334155;
   --color-line: #e9eef5;
   --color-line-strong: #d8e0ea;
   --color-brand: #6366f1;
@@ -108,6 +111,60 @@
   --color-danger-text: #b91c1c;
   --color-danger-tint: #fef2f2;
   --color-danger-hairline: #fecaca;
+}
+
+/* ── Dark theme — overrides the token vars when data-annot-theme="dark" (or "auto" + OS is dark).
+   --color-fg stays dark ON PURPOSE: it backs the inverted chrome (dock header, tooltips, scrims),
+   which keep white text in both themes. Text tokens (fg-secondary/muted) flip to light. ────────── */
+[data-annot-ui][data-annot-theme="dark"],
+[data-annot-theme="dark"] [data-annot-ui] {
+  --color-canvas: #0b1120;
+  --color-surface: #1e293b;
+  --color-sunken: #0f172a;
+  --color-row-alt: #263449;
+  --color-fg-secondary: #e2e8f0;
+  --color-fg-muted: #94a3b8;
+  --color-fg-disabled: #64748b;
+  --color-line: #334155;
+  --color-line-strong: #475569;
+  --color-brand-strong: #a5b4fc;
+  --color-brand-tint: #312e81;
+  --color-brand-hairline: #4338ca;
+  --color-success-text: #6ee7b7;
+  --color-success-tint: #064e3b;
+  --color-success-hairline: #065f46;
+  --color-warning-text: #fcd34d;
+  --color-warning-tint: #422006;
+  --color-warning-hairline: #78350f;
+  --color-danger-text: #fca5a5;
+  --color-danger-tint: #450a0a;
+  --color-danger-hairline: #7f1d1d;
+}
+@media (prefers-color-scheme: dark) {
+  [data-annot-ui][data-annot-theme="auto"],
+  [data-annot-theme="auto"] [data-annot-ui] {
+    --color-canvas: #0b1120;
+    --color-surface: #1e293b;
+    --color-sunken: #0f172a;
+    --color-row-alt: #263449;
+    --color-fg-secondary: #e2e8f0;
+    --color-fg-muted: #94a3b8;
+    --color-fg-disabled: #64748b;
+    --color-line: #334155;
+    --color-line-strong: #475569;
+    --color-brand-strong: #a5b4fc;
+    --color-brand-tint: #312e81;
+    --color-brand-hairline: #4338ca;
+    --color-success-text: #6ee7b7;
+    --color-success-tint: #064e3b;
+    --color-success-hairline: #065f46;
+    --color-warning-text: #fcd34d;
+    --color-warning-tint: #422006;
+    --color-warning-hairline: #78350f;
+    --color-danger-text: #fca5a5;
+    --color-danger-tint: #450a0a;
+    --color-danger-hairline: #7f1d1d;
+  }
 }
 [data-annot-ui] *,
 [data-annot-ui] *::before,
