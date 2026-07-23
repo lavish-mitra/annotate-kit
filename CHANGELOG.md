@@ -7,12 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- **Delivery targets** — optional one-click "send to…" buttons in the Send panel:
-  `githubIssueDelivery` (no token), `createWebhookDelivery`, and `createSlackDelivery`.
-- **Realtime** — adapters may implement `subscribe()`; the Supabase and Firebase adapters push live
-  updates (with a slow safety-net poll) so the overlay refreshes instantly instead of only polling.
+_Nothing yet — upcoming changes are tracked here._
 
 ## [0.1.0] — Initial release
 
@@ -38,6 +33,10 @@ feedback overlay for React, safe-by-default and free to use.
   colour prop; self-contained styles scoped to the widget.
 - **Accessibility** — dialog roles + `aria-modal` on the panel and modals,
   labelled controls, and `Escape` to dismiss.
+- **Delivery targets** — optional one-click "send to…" buttons in the Send panel:
+  `githubIssueDelivery` (no token), `createWebhookDelivery`, and `createSlackDelivery`.
+- **Realtime** — adapters may implement `subscribe()`; the Supabase and Firebase adapters push live
+  updates (with a slow safety-net poll) so the overlay refreshes instantly instead of only polling.
 
 ### Security
 

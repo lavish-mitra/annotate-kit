@@ -10,12 +10,30 @@ export one clean prompt for your developer or any AI assistant.
 Backend-agnostic. Safe by default. Free, and works with **zero sign-up**.
 
 [![npm](https://img.shields.io/npm/v/annotate-kit.svg)](https://www.npmjs.com/package/annotate-kit)
+[![downloads](https://img.shields.io/npm/dm/annotate-kit.svg)](https://www.npmjs.com/package/annotate-kit)
 [![CI](https://github.com/lavish-mitra/annotate-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/lavish-mitra/annotate-kit/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
+[![types: included](https://img.shields.io/npm/types/annotate-kit.svg)](https://www.npmjs.com/package/annotate-kit)
 [![React 18 · 19](https://img.shields.io/badge/React-18%20%C2%B7%2019-61dafb.svg)](https://react.dev)
 
 </div>
+
+---
+
+## 🎬 See it in action
+
+<!--
+  ▶ Add a demo GIF/screenshot here — it's the #1 thing that makes people try the package.
+  Easiest way (no image hosting needed):
+    1. Open a new GitHub issue on this repo (you don't have to submit it).
+    2. Drag your screenshot or .gif into the comment box — GitHub uploads it and
+       gives you a URL like  https://github.com/user-attachments/assets/xxxxxxxx
+    3. Replace the line below with:  ![annotate-kit demo](PASTE_THAT_URL)
+-->
+
+Spin it up in **30 seconds with zero backend** — [jump to the quick start](#-30-second-start-zero-backend-no-sign-up).
+Pin, draw, screenshot, and export a clean prompt, right inside your own app.
 
 ---
 
