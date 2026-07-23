@@ -1,0 +1,22 @@
+rules_version = '2';
+
+// annotate-kit — Cloud Storage rules for annotation screenshots. Merge into your storage.rules and deploy:
+//   firebase deploy --only storage
+//
+// Screenshots live under /annotations/**. Any signed-in user may read (so getDownloadURL works) and
+// upload. Delete is left open to signed-in users because Storage rules can't read Firestore ownership;
+// tighten to a per-user prefix if you need stricter control.
+//
+// NOTE: if you set storagePath on the adapter, rename the match path below to match.
+
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function annotSignedIn() { return request.auth != null; }
+
+    match /annotations/{allPaths=**} {
+      allow read: if annotSignedIn();
+      allow write: if annotSignedIn();   // create + update + delete
+    }
+  }
+}

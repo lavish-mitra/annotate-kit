@@ -1,0 +1,83 @@
+{
+  "name": "annotate-kit",
+  "version": "0.1.0",
+  "description": "Drop-in in-app annotation / visual-feedback overlay for React apps. Pin & draw on your live site, capture screenshots + console, export a clean prompt for your developer (Claude). Backend-agnostic via a small storage adapter — ships Supabase + Firebase adapters.",
+  "type": "module",
+  "license": "MIT",
+  "author": "lavish-mitra",
+  "sideEffects": [
+    "*.css"
+  ],
+  "files": [
+    "dist",
+    "backend",
+    "src",
+    "README.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./supabase": {
+      "types": "./dist/supabase.d.ts",
+      "import": "./dist/supabase.js"
+    },
+    "./firebase": {
+      "types": "./dist/firebase.d.ts",
+      "import": "./dist/firebase.js"
+    },
+    "./styles.css": "./dist/annotate-kit.css"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "npm run build:js && npm run build:css",
+    "build:js": "tsup",
+    "build:css": "tailwindcss -i ./src/styles/annotate.css -o ./dist/annotate-kit.css --minify",
+    "dev": "tsup --watch",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "react-dom": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "@supabase/supabase-js": {
+      "optional": true
+    },
+    "firebase": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "lucide-react": "^0.469.0",
+    "modern-screenshot": "^4.6.0"
+  },
+  "devDependencies": {
+    "@supabase/supabase-js": "^2.47.0",
+    "@tailwindcss/cli": "^4.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "firebase": "^11.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "tailwindcss": "^4.0.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.8"
+  },
+  "keywords": [
+    "annotation",
+    "feedback",
+    "visual-feedback",
+    "bug-report",
+    "screenshot",
+    "react",
+    "overlay",
+    "supabase",
+    "firebase",
+    "claude"
+  ]
+}

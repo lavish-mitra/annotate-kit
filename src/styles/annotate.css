@@ -1,0 +1,154 @@
+/* annotate-kit — self-contained stylesheet.
+   The overlay keeps HRMS's Tailwind class names; this file compiles JUST the utilities it uses,
+   with the design tokens given concrete values. Tailwind's global reset (preflight) is deliberately
+   NOT imported — instead a tiny reset scoped to [data-annot-ui] runs, so dropping this CSS into ANY
+   app (Tailwind or not, tokens or not) styles the widget correctly and touches nothing else. */
+
+@layer theme, base, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/utilities.css" layer(utilities);
+
+/* Only scan the widget's own source for class names. */
+@source "../Annotate.tsx";
+@source "../constants.ts";
+
+/* ── Design tokens (values lifted verbatim from the HRMS "Trust Enterprise Light" system) ── */
+@theme {
+  --color-canvas: #f6f8fb;
+  --color-surface: #ffffff;
+  --color-elevated: #ffffff;
+  --color-sunken: #f1f5f9;
+  --color-sidebar: #fbfcfe;
+  --color-table-head: #f3f6fa;
+  --color-row-alt: #fafbfd;
+
+  --color-fg: #0f172a;
+  --color-fg-secondary: #334155;
+  --color-fg-muted: #64748b;
+  --color-fg-disabled: #94a3b8;
+
+  --color-line: #e9eef5;
+  --color-line-strong: #d8e0ea;
+  --color-line-brand: #e0e3ff;
+
+  --color-brand: #6366f1;
+  --color-brand-strong: #4f46e5;
+  --color-brand-deep: #4338ca;
+  --color-brand-2: #8b5cf6;
+  --color-brand-tint: #eef0ff;
+  --color-brand-hairline: #e0e3ff;
+
+  --color-accent: #f59e0b;
+  --color-accent-text: #b45309;
+  --color-accent-tint: #fffbeb;
+  --color-accent-hairline: #fde68a;
+
+  --color-success: #059669;
+  --color-success-text: #047857;
+  --color-success-tint: #ecfdf5;
+  --color-success-hairline: #a7f3d0;
+  --color-warning: #f59e0b;
+  --color-warning-text: #b45309;
+  --color-warning-tint: #fffbeb;
+  --color-warning-hairline: #fde68a;
+  --color-danger: #dc2626;
+  --color-danger-text: #b91c1c;
+  --color-danger-tint: #fef2f2;
+  --color-danger-hairline: #fecaca;
+  --color-info: #2563eb;
+  --color-info-text: #1d4ed8;
+  --color-info-tint: #eff6ff;
+  --color-info-hairline: #bfdbfe;
+  --color-neutral-tint: #f1f5f9;
+
+  --radius-input: 0.625rem;
+  --radius-control: 0.625rem;
+  --radius-card: 0.875rem;
+  --radius-modal: 1.25rem;
+
+  --shadow-e1: 0 1px 2px rgba(16, 24, 40, 0.05);
+  --shadow-e2: 0 1px 3px rgba(16, 24, 40, 0.08), 0 1px 2px rgba(16, 24, 40, 0.06);
+  --shadow-e3: 0 8px 24px -6px rgba(16, 24, 40, 0.12);
+  --shadow-e4: 0 20px 48px -16px rgba(16, 24, 40, 0.28);
+  --shadow-brand: 0 10px 28px -10px rgba(99, 102, 241, 0.45);
+}
+
+/* ── Scoped reset — replaces preflight, ONLY inside the overlay ──────────────────────────────
+   Re-pinning the token vars here means the widget looks identical even if the host app happens to
+   define its own --color-surface / --color-fg-* etc. at :root. */
+[data-annot-ui] {
+  box-sizing: border-box;
+  font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+
+  --color-canvas: #f6f8fb;
+  --color-surface: #ffffff;
+  --color-sunken: #f1f5f9;
+  --color-row-alt: #fafbfd;
+  --color-fg: #0f172a;
+  --color-fg-secondary: #334155;
+  --color-fg-muted: #64748b;
+  --color-fg-disabled: #94a3b8;
+  --color-line: #e9eef5;
+  --color-line-strong: #d8e0ea;
+  --color-brand: #6366f1;
+  --color-brand-strong: #4f46e5;
+  --color-brand-tint: #eef0ff;
+  --color-brand-hairline: #e0e3ff;
+  --color-success: #059669;
+  --color-success-text: #047857;
+  --color-success-tint: #ecfdf5;
+  --color-success-hairline: #a7f3d0;
+  --color-warning: #f59e0b;
+  --color-warning-text: #b45309;
+  --color-warning-tint: #fffbeb;
+  --color-warning-hairline: #fde68a;
+  --color-danger: #dc2626;
+  --color-danger-text: #b91c1c;
+  --color-danger-tint: #fef2f2;
+  --color-danger-hairline: #fecaca;
+}
+[data-annot-ui] *,
+[data-annot-ui] *::before,
+[data-annot-ui] *::after {
+  box-sizing: border-box;
+}
+[data-annot-ui] button {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  line-height: inherit;
+  cursor: pointer;
+}
+[data-annot-ui] button:disabled {
+  cursor: default;
+}
+[data-annot-ui] input,
+[data-annot-ui] textarea,
+[data-annot-ui] select {
+  font: inherit;
+  color: inherit;
+  margin: 0;
+}
+[data-annot-ui] textarea {
+  line-height: 1.4;
+}
+[data-annot-ui] p,
+[data-annot-ui] pre {
+  margin: 0;
+}
+[data-annot-ui] svg {
+  display: inline-block;
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+[data-annot-ui] a {
+  color: inherit;
+}
+[data-annot-ui] kbd {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}

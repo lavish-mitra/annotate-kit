@@ -1,0 +1,40 @@
+rules_version = '2';
+
+// annotate-kit — Firestore rules. Merge these into your firestore.rules (inside the
+// existing `match /databases/{database}/documents { ... }` block) and deploy:
+//   firebase deploy --only firestore:rules
+//
+// Admin model: a user is an admin when their ID-token has custom claim
+//   admin == true   OR   role == 'admin'
+// (set via the Admin SDK: admin.auth().setCustomUserClaims(uid, { admin: true })).
+// The client adapter's isAdmin default matches this.
+//
+// NOTE: if you set collectionPath / settingsPath on the adapter, rename the match paths below to match.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function annotSignedIn() { return request.auth != null; }
+    function annotIsAdmin() {
+      return annotSignedIn() && (request.auth.token.admin == true || request.auth.token.role == 'admin');
+    }
+    function annotMyEmail() { return request.auth.token.email; }
+
+    match /annotations/{id} {
+      // Admins see everything; everyone else sees their own + public marks.
+      allow read: if annotIsAdmin()
+        || (annotSignedIn() && resource.data.created_by == annotMyEmail())
+        || (annotSignedIn() && resource.data.visibility == 'public');
+      // Create only as yourself.
+      allow create: if annotSignedIn() && request.resource.data.created_by == annotMyEmail();
+      // Edit / delete your own, or admin.
+      allow update, delete: if annotIsAdmin()
+        || (annotSignedIn() && resource.data.created_by == annotMyEmail());
+    }
+
+    match /annotate_settings/{doc} {
+      allow read: if annotSignedIn();     // everyone can read the on/off toggle
+      allow write: if annotIsAdmin();     // only admins flip it
+    }
+  }
+}
